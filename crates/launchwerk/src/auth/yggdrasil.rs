@@ -269,7 +269,10 @@ impl YggdrasilAuth {
             .map_err(|_| "Refresh request failed".to_string())?;
 
         if !response.status().is_success() {
-            return Err(format!("Refresh request returned HTTP {}", response.status()));
+            return Err(format!(
+                "Refresh request returned HTTP {}",
+                response.status()
+            ));
         }
 
         response
@@ -415,112 +418,134 @@ fn checked_refresh_user(
 
 // ── Authlib Injector Download ───────────────────────────────────────────────
 
-const AUTHLIB_INJECTOR_RELEASES_URL: &str =
-    "https://api.github.com/repos/moonlauncherDevs/authlib-injector/releases/latest";
+// Pin both the upstream release and its published checksum: this JAR runs as a JVM agent.
+const AUTHLIB_INJECTOR_URL: &str = "https://github.com/yushijinhun/authlib-injector/releases/download/v1.2.8/authlib-injector-1.2.8.jar";
+const AUTHLIB_INJECTOR_SHA256: &str =
+    "9c7f4343e6c82034958ffb48c14a2cb0c85928be7283103ce17da00c6d5a7b10";
+const AUTHLIB_INJECTOR_MAX_SIZE: usize = 2 * 1024 * 1024;
 
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
-    assets: Vec<GitHubAsset>,
+fn verify_injector_checksum(bytes: &[u8], expected: &str) -> Result<(), String> {
+    let actual = format!("{:x}", sha2::Sha256::digest(bytes));
+    if actual != expected {
+        return Err(format!(
+            "SHA-256 mismatch: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct GitHubAsset {
-    browser_download_url: String,
-    digest: Option<String>,
-}
-
-/// Download authlib-injector.jar to the shared directory if not already cached.
-/// Returns the path to the JAR file.
+/// Return the verified cached JVM agent, or download and atomically replace it.
 pub async fn download_authlib_injector(shared_dir: &Path) -> Result<PathBuf, String> {
     let cache_dir = shared_dir.join("authlib-injector");
     let jar_path = cache_dir.join("authlib-injector.jar");
 
-    // Check if already cached
-    if jar_path.exists() {
-        log::info!(
-            "authlib-injector.jar already cached at {}",
-            jar_path.display()
-        );
-        return Ok(jar_path);
+    use tokio::io::AsyncReadExt;
+    match tokio::fs::File::open(&jar_path).await {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take((AUTHLIB_INJECTOR_MAX_SIZE + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|e| format!("Cannot read cached JAR at {}: {e}", jar_path.display()))?;
+            if verify_injector_checksum(&bytes, AUTHLIB_INJECTOR_SHA256).is_ok() {
+                return Ok(jar_path);
+            }
+            log::warn!(
+                "Cached authlib-injector is damaged or differs from the pinned release; replacing it"
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "Cannot open cached JAR at {}: {e}",
+                jar_path.display()
+            ));
+        }
     }
 
-    log::info!("Downloading authlib-injector from moonlauncher fork...");
+    log::info!("Downloading authlib-injector from {AUTHLIB_INJECTOR_URL}");
     let client = Client::builder()
         .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(10))
         .user_agent("moonlauncher/2.0")
+        .https_only(true)
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
-    // Fetch latest release from GitHub
-    let release: GitHubRelease = client
-        .get(AUTHLIB_INJECTOR_RELEASES_URL)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch latest release: {}", e))?
-        .json()
-        .await
-        .map_err(|e| format!("Invalid release response: {}", e))?;
-
-    let asset = release
-        .assets
-        .into_iter()
-        .find(|a| a.browser_download_url.ends_with("authlib-injector.jar"))
-        .ok_or_else(|| "No authlib-injector.jar found in release".to_string())?;
-
-    // Parse SHA-256 from digest field ("sha256:HASH" format)
-    let expected_sha256 = asset
-        .digest
-        .as_deref()
-        .and_then(|d| d.strip_prefix("sha256:"))
-        .map(String::from);
-
-    log::info!(
-        "Downloading authlib-injector from {}",
-        asset.browser_download_url
-    );
-
-    // Download the JAR
-    let response = client
-        .get(&asset.browser_download_url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to download authlib-injector: {}", e))?;
-
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let mut response = client.get(AUTHLIB_INJECTOR_URL).send().await.map_err(|e| {
+        if e.is_timeout() {
+            format!("Timed out downloading JAR from {AUTHLIB_INJECTOR_URL}")
+        } else {
+            format!("Failed to download JAR: {e:#}")
+        }
+    })?;
     if !response.status().is_success() {
         return Err(format!(
-            "Failed to download authlib-injector: HTTP {}",
+            "Failed to download JAR: HTTP {}",
             response.status()
         ));
     }
 
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| format!("Failed to read authlib-injector response: {}", e))?;
-
-    // Verify checksum
-    let hash = sha2::Sha256::digest(&bytes);
-    let hash_hex = format!("{:x}", hash);
-    if let Some(ref expected) = expected_sha256 {
-        if hash_hex != *expected {
-            return Err(format!(
-                "authlib-injector checksum mismatch: expected {}, got {}",
-                expected, hash_hex
-            ));
+        .map_err(|e| format!("Failed to read JAR response: {e}"))?
+    {
+        if chunk.len() > AUTHLIB_INJECTOR_MAX_SIZE - bytes.len() {
+            return Err("Downloaded JAR exceeds the size limit".into());
         }
-        log::info!("authlib-injector SHA-256 verified: {}", hash_hex);
-    } else {
-        log::warn!("No SHA-256 digest in release asset, skipping checksum verification");
+        bytes.extend_from_slice(&chunk);
     }
+    verify_injector_checksum(&bytes, AUTHLIB_INJECTOR_SHA256)?;
 
-    // Save to disk
-    std::fs::create_dir_all(&cache_dir)
-        .map_err(|e| format!("Failed to create cache directory: {}", e))?;
-    std::fs::write(&jar_path, &bytes)
-        .map_err(|e| format!("Failed to write authlib-injector.jar: {}", e))?;
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| format!("Cannot create cache directory {}: {e}", cache_dir.display()))?;
+    let temp_path = cache_dir.join(format!("authlib-injector-{}.tmp", uuid::Uuid::new_v4()));
+    let result = async {
+        tokio::fs::write(&temp_path, &bytes).await?;
+        tokio::fs::rename(&temp_path, &jar_path).await
+    }
+    .await;
+    if let Err(e) = result {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(format!(
+            "Cannot save verified JAR at {}: {e}",
+            jar_path.display()
+        ));
+    }
 
     log::info!("authlib-injector.jar downloaded and cached");
     Ok(jar_path)
+}
+
+#[cfg(test)]
+mod injector_tests {
+    use super::*;
+
+    #[test]
+    fn checksum_rejects_modified_bytes() {
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(verify_injector_checksum(b"abc", expected).is_ok());
+        assert!(verify_injector_checksum(b"ab", expected).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the pinned upstream JAR over HTTPS"]
+    async fn downloads_reuses_and_repairs_injector() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = download_authlib_injector(dir.path()).await.unwrap();
+        let modified = std::fs::metadata(&jar).unwrap().modified().unwrap();
+        assert_eq!(download_authlib_injector(dir.path()).await.unwrap(), jar);
+        assert_eq!(
+            std::fs::metadata(&jar).unwrap().modified().unwrap(),
+            modified
+        );
+        std::fs::write(&jar, b"partial download").unwrap();
+        assert_eq!(download_authlib_injector(dir.path()).await.unwrap(), jar);
+        verify_injector_checksum(&std::fs::read(&jar).unwrap(), AUTHLIB_INJECTOR_SHA256).unwrap();
+        assert_eq!(std::fs::read_dir(jar.parent().unwrap()).unwrap().count(), 1);
+    }
 }
 
 /// Fetch the Yggdrasil API metadata and return it as a Base64 string

@@ -685,7 +685,7 @@ impl Launcher {
                 // This session must use the same API root for validation and in the JVM.
                 let jar_path = yggdrasil::download_authlib_injector(&shared_dir)
                     .await
-                    .map_err(|_| DownloadError::Request("Authlib Injector".into()))?;
+                    .map_err(|e| DownloadError::Request(format!("authlib-injector: {e}")))?;
                 extra_jvm_args.push(format!("-javaagent:{}={}", jar_path.display(), api_root));
                 builder = builder.authlib_injector_path(jar_path);
                 if let Ok(metadata_b64) = yggdrasil::fetch_metadata_prefetch(api_root).await {
