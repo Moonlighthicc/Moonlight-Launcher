@@ -8,10 +8,7 @@ pub use services::InstanceManager;
 pub fn run() {
     let mut context = tauri::generate_context!();
 
-    // Auto-updates are disconnected from the launcher: the updater code is kept, but
-    // nothing is configured or registered, so no update server is ever contacted.
-    // Flip this to `true` (and set your own endpoints) to wire it back in.
-    const UPDATER_AVAILABLE: bool = false;
+    const UPDATER_AVAILABLE: bool = cfg!(desktop);
 
     if UPDATER_AVAILABLE {
         let plugins = &mut context.config_mut().plugins.0;

@@ -8,7 +8,7 @@
         "@tauri-apps/api": "^2.12.1",
         "@tauri-apps/plugin-dialog": "2.8.1",
         "@tauri-apps/plugin-process": "2.4.0",
-        "@tauri-apps/plugin-updater": "2.14.1",
+        "@tauri-apps/plugin-updater": "~2",
         "dompurify": "^3.4.17",
         "marked": "^18.0.14",
         "skin3d": "^0.2.0",
@@ -38,9 +38,6 @@
       },
     },
   },
-  "trustedDependencies": [
-    "@parcel/watcher",
-  ],
   "packages": {
     "@bufbuild/protobuf": ["@bufbuild/protobuf@2.17.0", "", {}, "sha512-hcPkSz6D7MiTU/5VBBhK+kxaYDoOdQ6yJRFJ3kS8Nydp+VZXfg1vrpABKPNod8bXMufsVCmiUJVIKFzCzta4uw=="],
 

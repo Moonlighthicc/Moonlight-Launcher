@@ -665,8 +665,8 @@
       }
     },
     "authorship": {
-      "title": "Authorship",
-      "followUpdates": "You can follow updates here:",
+      "title": "About",
+      "githubReleases": "GitHub Releases",
       "website": "Website",
       "forkNotice": "MoonlightLauncher is a fork of CubicLauncher. It is a project originally created by other people, and all credit for the original work belongs to them.",
       "originalAuthors": "Original authors: Notstaff and Santiagolxx.",
@@ -1392,7 +1392,8 @@
     "sortDownloads": "Downloads",
     "sortNewest": "Newest",
     "downloadingModpack": "Downloading modpack...",
-    "installingModpack": "Installing modpack...",
+    "installingModpack": "Installing modpack…",
+    "hideDownload": "Continue in background",
     "installBtn": "Install",
     "loadMore": "Load more",
     "downloads": "downloads",

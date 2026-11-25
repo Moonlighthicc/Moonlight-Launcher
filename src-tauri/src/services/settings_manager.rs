@@ -165,7 +165,7 @@ pub struct SettingsManager {
     pub jre25_vendor: CompactString,
     #[serde(default = "default_lang")]
     pub language: CompactString,
-    /// Legacy flag: auto-updates are disconnected from the launcher.
+    /// Check for launcher updates automatically and notify when one is available.
     #[serde(default)]
     pub auto_updates: bool,
     #[serde(default = "default_update_channel")]

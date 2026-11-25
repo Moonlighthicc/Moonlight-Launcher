@@ -8,9 +8,11 @@
 		getAvailableVersions,
 		downloadCurseForgeModpack,
 		installCurseForgeModpack,
+		isCancelError,
 		openUrl,
 	} from "$lib/api/cubicApi";
 	import { trackConnecting } from "$lib/state/downloadQueueState.svelte";
+	import { dismissModpackInstall, modpackInstalls, retryModpackInstall, runModpackInstall } from "$lib/state/modpackInstalls.svelte";
 	import type {
 		CurseForgeProject,
 		CurseForgeFile,
@@ -18,7 +20,6 @@
 	} from "$lib/types/types";
 	import HtmlRenderer from "$lib/components/ui/HtmlRenderer.svelte";
 	import Loading from "$lib/icons/Loading.svelte";
-	import { showErrorParsed } from "$lib/state/state.svelte";
 	import { invokeMarket } from "$lib/api/marketRequest";
 	import {
 		releaseChannel,
@@ -78,8 +79,7 @@
 	let selectedPack = $state<CurseForgeProject | null>(null);
 	let versions = $state<CurseForgeFile[]>([]);
 	let loadingVersions = $state(false);
-	let installing = $state(false);
-	let installTask = $state<{ archive: string; name: string }>();
+	const task = $derived(selectedItem ? modpackInstalls.get(`curseforge:${selectedItem.id}`) : undefined);
 	let installError = $state<string | null>(null);
 	let browser = $state<ReturnType<typeof ModpackBrowser>>();
 
@@ -396,20 +396,18 @@
 	}
 
 	export function goBackOnEscape() {
-		return installing || (browser?.goBackOnEscape() ?? false);
+		return browser?.goBackOnEscape() ?? false;
 	}
 
 	async function doInstall(versionId: string, name: string) {
-		if (!selectedPack || !versionId || loadingVersions || installing)
-			return;
-		installing = true;
-		installTask = { archive: `cfpack-dl-${versionId}`, name };
-		installError = null;
 		const pack = selectedPack;
-		onInstallStarted?.(name);
-		try {
-			const file = versions.find((v) => String(v.id) === versionId);
-			if (!file) throw new Error("Version not found");
+		const file = versions.find((v) => String(v.id) === versionId);
+		if (!pack || !file || loadingVersions || task) return;
+		const key = `curseforge:${pack.id}`;
+		const archive = `cfpack-dl-${file.id}`;
+		installError = null;
+		const success = await runModpackInstall(key, { archive, name, version: versionId }, async () => {
+			onInstallStarted?.(name);
 
 			let url = file.downloadUrl;
 			if (!url) {
@@ -421,11 +419,9 @@
 			}
 			if (!url) throw new Error("No download URL found for this modpack");
 
-			const packPath = await trackConnecting(`cfpack-dl-${file.id}`, () =>
+			const packPath = await trackConnecting(archive, () =>
 				downloadCurseForgeModpack(url, file.id),
 			);
-			if (!packPath) throw new Error(t("modpack.downloadFailed"));
-
 			const result = await installCurseForgeModpack(
 				packPath,
 				name,
@@ -433,22 +429,28 @@
 				file.id,
 				pack.logo?.url ?? undefined,
 				undefined,
-				(err) => {
-					installError = String(err);
-				},
+				(err) => { throw err; },
+				false,
 			);
-			if (!result && !installError) {
-				installError = t("modpack.installFailed");
-			}
-		} catch (e) {
-			installError = String(e);
-			showErrorParsed(e);
-		} finally {
-			installing = false;
-			installTask = undefined;
-			if (installError) onInstallFailed?.(name);
-			else onInstalled?.();
+			if (!result) throw new Error(t("modpack.installFailed"));
+		}, isCancelError);
+		if (!success) {
+			onInstallFailed?.(name);
+		} else if (alive && selectedPack?.id === pack.id) {
+			onInstalled?.();
 		}
+	}
+
+	async function retryInstall() {
+		if (!task || task.error === null || !selectedItem) return;
+		const { id } = selectedItem;
+		const { name } = task;
+		if (!(await retryModpackInstall(`curseforge:${id}`))) onInstallFailed?.(name);
+		else if (alive && selectedItem?.id === id) onInstalled?.();
+	}
+
+	function dismissInstall() {
+		if (selectedItem) dismissModpackInstall(`curseforge:${selectedItem.id}`);
 	}
 
 	const loaders: PackLoaders = {
@@ -481,9 +483,9 @@
 	bind:selectedItem
 	{versionOptions}
 	{loadingVersions}
-	{installing}
-	{installTask}
-	{installError}
+	installing={task?.running ?? false}
+	installTask={task}
+	installError={task?.error ?? installError}
 	{gallery}
 	{website}
 	{loaders}
@@ -499,6 +501,8 @@
 	onSelect={handleSelect}
 	onBack={handleBack}
 	onInstall={doInstall}
+	onRetryInstall={retryInstall}
+	onDismissInstall={dismissInstall}
 >
 	{#snippet detailExtra(_item)}
 		{#if loadingDescription}

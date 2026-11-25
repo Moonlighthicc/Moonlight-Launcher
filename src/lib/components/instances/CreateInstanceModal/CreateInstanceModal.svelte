@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { fade } from "svelte/transition";
-	import { MediaQuery, SvelteSet } from "svelte/reactivity";
+	import { MediaQuery } from "svelte/reactivity";
 	import { animDuration } from "$lib/utils/animations";
 	import {
 		createInstance,
@@ -18,6 +18,7 @@
 	import {
 		downloads,
 		getOverallPct,
+		pendingVersionDownloads as pendingDownloads,
 		trackConnecting,
 	} from "$lib/state/downloadQueueState.svelte";
 	import {
@@ -63,9 +64,7 @@
 	type CreationMode = "choose" | "manual" | "pack" | "instance" | "migration";
 	let mode = $state<CreationMode>("choose");
 	let versionLoading = $state(false);
-	const pendingDownloads = new SvelteSet<string>();
 	let creatingVersion = $state("");
-	let packInstalling = $state(false);
 	const createProgress = $derived(downloads.get(creatingVersion));
 	const reducedMotion = new MediaQuery("(prefers-reduced-motion: reduce)");
 	const contentDuration = $derived(
@@ -90,19 +89,16 @@
 		},
 	]);
 
-	// ── Instance fields ─────────────────────────────────────────────────────────
 	let name = $state("");
 	let selectedIcon = $state<string | null>(null);
 	let customIconPath = $state<string | null>(null);
 
-	// ── Version selector ──────────────────────────────────────────────────────
 	let selectedLoader = $state("vanilla");
 	let selectedMcVersion = $state("");
 	let selectedLoaderVersion = $state("");
 
 	const finalVersionId = $derived(instanceVersionId(selectedLoader, selectedMcVersion, selectedLoaderVersion));
 
-	// ── Common ──────────────────────────────────────────────────────────────────
 	let loading = $state(false);
 	let modrinthBrowser = $state<ReturnType<typeof ModrinthModpackBrowser>>();
 	let curseForgeBrowser = $state<ReturnType<typeof CurseForgeModpackBrowser>>();
@@ -217,8 +213,6 @@
 				await waitForInstallation(id);
 				creatingVersion = "";
 			}
-			// createInstance does not await async callbacks. Keep setup in this
-			// operation so the modal stays busy and setup errors remain visible.
 			const uuid = await new Promise<string>((resolve, reject) => {
 				void createInstance(
 					instanceName,
@@ -229,8 +223,7 @@
 				).catch(reject);
 			});
 			if (customIcon) await uploadCustomIcon(uuid, customIcon);
-			open = false;
-			resetState();
+			reset();
 			oncreated?.();
 		} catch (err) {
 			error = `${t("createInstance.createErr")}: ${String(err)}`;
@@ -260,7 +253,7 @@
 	}
 
 	async function waitForInstallation(id: string) {
-		let missing = 0;
+		let missingSince: number | undefined;
 		while (!isVersionInstalled(id)) {
 			if (!pendingDownloads.has(id)) {
 				const task = downloads.get(id);
@@ -270,8 +263,10 @@
 				if (!snapshot && task?.error) throw new Error(task.error);
 				const active = status === "pending" || status === "downloading" ||
 					(!snapshot && task && !task.done && !task.error);
-				missing = active ? 0 : missing + 1;
-				if (status === "done" || (!snapshot && task?.done) || missing >= 3) {
+				if (active) missingSince = undefined;
+				else missingSince ??= Date.now();
+				if (status === "done" || (!snapshot && task?.done) ||
+					(missingSince !== undefined && Date.now() - missingSince >= 15_000)) {
 					await loadInstalledVersions(true);
 					if (!isVersionInstalled(id)) throw new Error(t("modpack.downloadFailed"));
 					return;
@@ -281,8 +276,8 @@
 		}
 	}
 
-	// ── Reset ───────────────────────────────────────────────────────────────────
 	function resetState() {
+		creatingVersion = "";
 		name = "";
 		selectedLoader = "vanilla";
 		selectedMcVersion = "";
@@ -304,18 +299,20 @@
 		resetState();
 	}
 
+	function close() {
+		open = false;
+		if (!creatingVersion) resetState();
+	}
+
 	function handleModpackInstallStarted(instanceName: string) {
-		packInstalling = true;
 		oninstallstarted?.(instanceName);
 	}
 
 	function handleModpackInstallFailed(instanceName: string) {
-		packInstalling = false;
 		oninstallfailed?.(instanceName);
 	}
 
 	function handleModpackInstalled() {
-		packInstalling = false;
 		reset();
 	}
 
@@ -331,10 +328,10 @@
 		<button
 			type="button"
 			class="btn-secondary"
-			onclick={reset}
-			disabled={loading}
+			onclick={close}
+			disabled={loading && !creatingVersion}
 		>
-			{t("createInstance.cancel")}
+			{creatingVersion ? t("createInstance.hideDownload") : t("createInstance.cancel")}
 		</button>
 		<button
 			type="button"
@@ -362,9 +359,9 @@
 	showScrollToTop={mode === "pack" && (tab === "modrinth" || tab === "curseforge")}
 	title={t("createInstance.title")}
 	width={mode === "pack" || mode === "manual" ? "800px" : "700px"}
-	closeDisabled={loading || packInstalling}
-	onescape={goBackOnEscape}
-	onclose={reset}
+	closeDisabled={loading && !creatingVersion}
+	onescape={() => !creatingVersion && goBackOnEscape()}
+	onclose={close}
 	footer={mode === "manual" ? manualFooter : undefined}
 >
 	{#snippet headerActions()}
@@ -372,7 +369,7 @@
 			<button
 				type="button"
 				class="change-method"
-				disabled={loading || packInstalling}
+			disabled={loading}
 				onclick={chooseMethod}
 			>
 				<Icon name="ui:chevron-left" size={14} />
@@ -482,7 +479,7 @@
 						role="tab"
 						aria-selected={tab === tabItem.id}
 						class:active={tab === tabItem.id}
-						disabled={loading || packInstalling}
+						disabled={loading}
 						onclick={() => (tab = tabItem.id)}
 					>
 						<Icon name={tabItem.iconName} size={18} />

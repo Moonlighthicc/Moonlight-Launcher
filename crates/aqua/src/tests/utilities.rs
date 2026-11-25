@@ -1,6 +1,14 @@
 use super::*;
 
 #[test]
+fn download_backoff_gives_the_connection_time_to_recover() {
+    assert_eq!(download_retry_delay(1, 0), Duration::from_secs(1));
+    assert_eq!(download_retry_delay(5, 0), Duration::from_secs(16));
+    assert_eq!(download_retry_delay(2, 20), Duration::from_secs(20));
+    assert_eq!(download_retry_delay(2, 500), Duration::from_secs(120));
+}
+
+#[test]
 fn test_file_hasher_selects_algorithm_by_length() {
     // SHA-256 (64 caracteres) para los paquetes de JRE.
     let mut hasher = FileHasher::for_hash(&"0".repeat(64));

@@ -29,6 +29,8 @@
 	import { isVersionDownloading } from "$lib/state/downloadState.svelte";
 	import {
 		loaderVersionId,
+		pendingVersionDownloads as enqueueing,
+		downloads,
 		trackConnecting,
 	} from "$lib/state/downloadQueueState.svelte";
 	import { launcherStore } from "$lib/state/state.svelte";
@@ -77,7 +79,6 @@
 	let refreshing = $state(false);
 	let sourceError = $state<string | null>(null);
 	let deleteError = $state("");
-	const enqueueing = new SvelteSet<string>();
 	let search = $state("");
 	let onlyInstalled = $state(false);
 	$effect(() => {
@@ -296,9 +297,21 @@
 		}
 	}
 
+	function downloadId(item: CatalogItem) {
+		return item.loader
+			? loaderVersionId(loaderTab, item.loader.game_version, item.loader.display_version) ?? item.id
+			: item.id;
+	}
+
+	function isDownloading(id: string) {
+		const task = downloads.get(id);
+		return enqueueing.has(id) || isVersionDownloading(id) || !!(task && !task.done && !task.error);
+	}
+
 	async function handleDownload(item: CatalogItem) {
-		if (enqueueing.has(item.id) || isVersionDownloading(item.id)) return;
-		enqueueing.add(item.id);
+		const id = downloadId(item);
+		if (isDownloading(id)) return;
+		enqueueing.add(id);
 		try {
 			if (!item.loader) {
 				await trackConnecting(item.id, () => addToQueue(item.id));
@@ -306,7 +319,7 @@
 				const { game_version: mc, display_version: version } =
 					item.loader;
 				await trackConnecting(
-					loaderVersionId(loaderTab, mc, version) ?? item.id,
+					id,
 					async () => {
 						if (loaderTab === "fabric") await downloadFabric(mc, version);
 						else if (loaderTab === "quilt")
@@ -324,7 +337,7 @@
 		} catch {
 			// The API displays download errors and the button becomes available for retry.
 		} finally {
-			enqueueing.delete(item.id);
+			enqueueing.delete(id);
 		}
 	}
 
@@ -569,9 +582,7 @@
 								{@const installed = installedVersions.has(
 									item.id,
 								)}
-								{@const downloading =
-									isVersionDownloading(item.id) ||
-									enqueueing.has(item.id)}
+								{@const downloading = isDownloading(downloadId(item))}
 								<div class="version-row" class:installed>
 									<div class="row-icon">
 										<Icon

@@ -1,11 +1,9 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-
-const pkg = JSON.parse(readFileSync("./package.json", "utf-8"));
+const tauriConfig = JSON.parse(
+	readFileSync(new URL("./src-tauri/tauri.conf.json", import.meta.url), "utf-8"),
+);
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -14,7 +12,7 @@ export default defineConfig(async () => ({
 	plugins: [sveltekit()],
 
 	define: {
-		__APP_VERSION__: JSON.stringify(pkg.version),
+		__APP_VERSION__: JSON.stringify(tauriConfig.version),
 	},
 
 	// Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

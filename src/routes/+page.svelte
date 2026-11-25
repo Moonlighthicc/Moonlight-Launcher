@@ -29,6 +29,7 @@
         import AccountSetup from "$lib/components/layout/auth/AccountSetup.svelte";
         import { getAccountProvider } from "$lib/utils/accountProviders";
         import { updaterState } from "$lib/state/updaterState.svelte";
+        import { startAutoUpdates } from "$lib/api/updaterServices";
         import Icon from "$lib/icons/Icon.svelte";
         import { t } from "$lib/i18n";
         import {
@@ -269,8 +270,10 @@
         let startupReady = $state(false);
         let destroyed = false;
 
-        // Las actualizaciones automáticas están desconectadas del launcher
-        // (ver updaterServices.startAutoUpdates); el código se conserva.
+        $effect(() => {
+                if (logParams || !settingsReady || !launcherStore.settings.auto_updates) return;
+                return startAutoUpdates();
+        });
 
         onMount(async () => {
                 injectProjectFonts();

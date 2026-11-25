@@ -39,19 +39,23 @@
 		description,
 		onBack,
 		onInstall,
+		onRetryInstall,
+		onDismissInstall,
 		loaders,
 	}: {
 		item: ModpackItem;
 		versions: PackVersion[];
 		loading: boolean;
 		installing: boolean;
-		installTask?: { archive: string; name: string };
+		installTask?: { archive: string; version: string; name: string; error: string | null };
 		error: string | null;
 		gallery: PackGalleryImage[];
 		website?: string;
 		description?: Snippet<[ModpackItem]>;
 		onBack?: () => void;
 		onInstall?: (version: string, name: string) => void;
+		onRetryInstall?: () => void;
+		onDismissInstall?: () => void;
 		loaders?: PackLoaders;
 	} = $props();
 	const installProgress = $derived.by(() => {
@@ -93,7 +97,7 @@
 	}
 
 	const pickerList = $derived(visiblePackVersions(versions, showAlpha));
-	const selectedId = $derived(selection === undefined ? pickerList.latest : selection);
+	const selectedId = $derived(installTask?.version ?? (selection === undefined ? pickerList.latest : selection));
 	const selected = $derived(versions.find((v) => v.value === selectedId));
 	const fileList = $derived(
 		visiblePackVersions(versions, showAlpha, releaseFilter),
@@ -255,7 +259,7 @@
 	}
 
 	export function goBackOnEscape() {
-		if (installing || composingName) return;
+		if (composingName) return;
 		if (picker) closePicker();
 		else if (editing) cancelNameEdit();
 		else if (tab !== "description") changeTab("description");
@@ -301,7 +305,6 @@
 	<button
 		type="button"
 		class="secondary back"
-		disabled={installing}
 		onclick={onBack}
 	>
 		<Icon name="ui:chevron-left" size={16} />
@@ -354,7 +357,7 @@
 							bind:this={nameInput}
 							value={draft}
 							maxlength={MAX_INSTANCE_NAME_LEN}
-							disabled={installing}
+							disabled={!!installTask}
 							aria-invalid={!!nameError}
 							oninput={(e) => updateDraft(e.currentTarget.value)}
 							oncompositionstart={() => {
@@ -377,12 +380,12 @@
 				{:else}
 					<span class="muted">{t("createInstance.nameLabel")}</span>
 					<div class="name-row">
-						<strong>{name ?? generatedName}</strong><button
+						<strong>{installTask?.name ?? name ?? generatedName}</strong><button
 							type="button"
 							class="text-action"
 							bind:this={editNameButton}
 							onclick={editName}
-							disabled={installing}
+							disabled={!!installTask}
 							>{t("createInstance.pack.editName")}</button
 						>
 					</div>
@@ -390,26 +393,37 @@
 				<span class="muted" role="status">{nameSaved ? t("createInstance.pack.nameSaved") : ""}</span>
 			</div>
 			<div class="install-actions">
-				<button
-					type="button"
-					class="btn-primary install-button"
-					disabled={installing || loading || composingName || !selected}
-					onclick={installClick}
-				>
-					{#if installing}
-						<Loading size={16} />
-						{t("createInstance.installingModpack")} {installProgress ? getOverallPct(installProgress) : 0}%
-					{:else}
-						{t("createInstance.installBtn")}
-					{/if}
-				</button>
+				{#if installTask?.error != null}
+					<div class="retry-actions">
+						<button type="button" class="btn-primary install-button" onclick={onRetryInstall}>
+							{t("common.retry")}
+						</button>
+						<button type="button" class="secondary install-button" onclick={onDismissInstall}>
+							{t("common.cancel")}
+						</button>
+					</div>
+				{:else}
+					<button
+						type="button"
+						class="btn-primary install-button"
+						disabled={installing || loading || composingName || !selected}
+						onclick={installClick}
+					>
+						{#if installing}
+							<Loading size={16} />
+							{t("createInstance.installingModpack")} {installProgress ? getOverallPct(installProgress) : 0}%
+						{:else}
+							{t("createInstance.installBtn")}
+						{/if}
+					</button>
+				{/if}
 				<div class="version-summary">
-					<span class="version-label">{selected?.label ?? t("createInstance.pack.noVersionSelected")}</span>
+					<span class="version-label">{selected?.label ?? installTask?.version ?? t("createInstance.pack.noVersionSelected")}</span>
 				{#each selected?.packLoaders ?? [] as loader (loader)}
 					<PackLoaderBadge {loader} />
 				{/each}
 					<button type="button" class="text-action"
-						disabled={installing || loading || !versions.length}
+						disabled={!!installTask || loading || !versions.length}
 						aria-expanded={picker}
 						aria-controls={picker ? `${controlId}-picker` : undefined}
 						onclick={(e) => openPicker(e.currentTarget)}>
@@ -582,7 +596,7 @@
 								<button
 									type="button"
 									class="secondary"
-									disabled={installing}
+									disabled={!!installTask}
 									onclick={() => {
 									if (selectedId === version.value) selection = null;
 										else chooseVersion(version);
@@ -785,6 +799,12 @@
 		min-height: calc(var(--button-height) + 4px);
 		min-width: min(104px, 100%);
 	}
+	.retry-actions {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 8px;
+	}
 	.version-summary {
 		display: flex;
 		justify-content: flex-end;
@@ -876,6 +896,7 @@
 	.error {
 		color: var(--color-error);
 		margin-top: 6px;
+		overflow-wrap: anywhere;
 	}
 	.gallery {
 		display: grid;

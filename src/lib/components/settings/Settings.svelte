@@ -13,7 +13,7 @@
 		flushSettingsSaves,
 		onAppEvent,
 	} from "$lib/api/launcherService";
-	import { openUrl } from "$lib/api/cubicApi";
+	import { updater } from "$lib/api/updaterServices";
 	import { t } from "$lib/i18n";
 	import LanguageSelect from "$lib/components/layout/LanguageSelect.svelte";
 	import Select from "$lib/components/layout/Select.svelte";
@@ -303,7 +303,18 @@
 					iconName="ui:interface"
 					storageKey="section_authorship"
 				>
-					<AuthorshipSection />
+					<AuthorshipSection onCheckUpdates={updater.open}>
+						{#snippet updatePreference()}
+							<div class="qm-field-checkbox">
+								<ToggleSwitch
+									id="auto-updates"
+									bind:checked={launcherStore.settings.auto_updates}
+									onchange={handleSave}
+								/>
+								<label for="auto-updates">{t("settings.launcher.autoUpdates")}</label>
+							</div>
+						{/snippet}
+					</AuthorshipSection>
 				</CollapsibleSection>
 
 				<CollapsibleSection

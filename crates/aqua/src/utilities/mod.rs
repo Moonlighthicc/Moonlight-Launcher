@@ -1,7 +1,8 @@
 use std::path::Path;
 use std::sync::LazyLock;
+use std::time::Duration;
 
-use log::{debug, error, warn};
+use log::{debug, warn};
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use sha1::{Digest, Sha1};
@@ -15,13 +16,10 @@ use crate::AquaError;
 
 pub static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
-        .user_agent("Cubic Proton/2.0")
-        // Timeouts cortos: con VPN/red inestable un socket muerto no debe dejar
-        // la descarga colgada en "Подключение" decenas de segundos.
-        .connect_timeout(std::time::Duration::from_secs(6))
-        .read_timeout(std::time::Duration::from_secs(15))
-        // Detecta conexiones rotas (cambio de VPN / red) en pocos segundos.
-        .tcp_keepalive(std::time::Duration::from_secs(5))
+        .user_agent("MoonlightLauncher")
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(5))
         .tcp_nodelay(true)
         // Las conexiones inactivas se descartan pronto para no reutilizar un
         // socket que quedó huérfano tras apagar/encender la red o la VPN.
@@ -32,7 +30,13 @@ pub static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .expect("Failed to build reqwest client")
 });
 
-const MAX_DOWNLOAD_ATTEMPTS: usize = 4;
+const MAX_DOWNLOAD_ATTEMPTS: usize = 6;
+const DOWNLOAD_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn download_retry_delay(attempt: usize, retry_after: u64) -> Duration {
+    let backoff = 1 << attempt.saturating_sub(1).min(5);
+    Duration::from_secs(backoff.max(retry_after.min(120)))
+}
 
 /// Tiempo máximo de espera de las cabeceras de una respuesta antes de reintentar.
 const REQUEST_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
@@ -275,8 +279,7 @@ pub async fn download_file_with_headers(
         if is_mirror && crate::provider::mirror_cooldown_active() {
             continue;
         }
-        // Ante cualquier fallo del espejo se cae al oficial de inmediato, que ya
-        // aplica sus propios reintentos. El oficial conserva los 3 intentos.
+        // Fall back to the origin before spending time on retries.
         let attempts = if is_mirror { 1 } else { MAX_DOWNLOAD_ATTEMPTS };
         match download_single_url(candidate, path, expected_hash, reporter, headers, attempts).await
         {
@@ -338,7 +341,8 @@ async fn download_single_url(
             }
             request = request.headers(header_map);
         }
-        let response = match tokio::time::timeout(REQUEST_HEADERS_TIMEOUT, hedged_send(request)).await {
+        let timeout = if is_mirror { REQUEST_HEADERS_TIMEOUT } else { DOWNLOAD_HEADERS_TIMEOUT };
+        let response = match tokio::time::timeout(timeout, request.send()).await {
             Ok(Ok(r)) if r.status().is_success() => r,
             Ok(Ok(r)) => {
                 // El WAF de BMCLAPI limita por IP: abrimos el circuito y dejamos
@@ -363,8 +367,7 @@ async fn download_single_url(
                 if attempt == max_attempts {
                     return Err(AquaError::Other(format!("HTTP {}", r.status())));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << (attempt - 1))))
-                    .await;
+                tokio::time::sleep(download_retry_delay(attempt, retry_after_secs(&r))).await;
                 continue;
             }
             Err(_) => {
@@ -372,8 +375,7 @@ async fn download_single_url(
                 if attempt == max_attempts {
                     return Err(AquaError::Other("Request timed out".into()));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << (attempt - 1))))
-                    .await;
+                tokio::time::sleep(download_retry_delay(attempt, 0)).await;
                 continue;
             }
             Ok(Err(e)) => {
@@ -381,8 +383,7 @@ async fn download_single_url(
                 if attempt == max_attempts {
                     return Err(AquaError::RequestError(e));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << (attempt - 1))))
-                    .await;
+                tokio::time::sleep(download_retry_delay(attempt, 0)).await;
                 continue;
             }
         };
@@ -406,16 +407,16 @@ async fn download_single_url(
         let mut stream = response.bytes_stream();
 
         use futures::StreamExt;
-        let mut write_ok = true;
+        let mut stream_error = None;
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
                     let len = chunk.len() as u64;
                     hasher.update(&chunk);
-                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
-                        error!("Write error: {}", e);
-                        write_ok = false;
-                        break;
+                    if let Err(e) = file.write_all(&chunk).await {
+                        drop(file);
+                        let _ = tokio::fs::remove_file(&temp_file).await;
+                        return Err(AquaError::IoError(e));
                     }
                     if let Some(r) = reporter {
                         r.report_delta(len);
@@ -423,21 +424,24 @@ async fn download_single_url(
                 }
                 Err(e) => {
                     warn!("Stream error on attempt {}: {}", attempt, e);
-                    write_ok = false;
+                    stream_error = Some(e);
                     break;
                 }
             }
         }
 
-        if !write_ok {
+        if let Some(error) = stream_error {
+            drop(file);
             let _ = tokio::fs::remove_file(&temp_file).await;
             if attempt == max_attempts {
-                return Err(AquaError::Other("Download stream failed".into()));
+                return Err(AquaError::RequestError(error));
             }
+            tokio::time::sleep(download_retry_delay(attempt, 0)).await;
             continue;
         }
 
         file.flush().await?;
+        drop(file);
 
         // Verify hash if provided
         if !expected_hash.is_empty() {
@@ -458,12 +462,10 @@ async fn download_single_url(
             }
         }
 
+        tokio::fs::rename(&temp_file, path).await?;
         if let Some(r) = reporter {
             r.settle();
         }
-
-        // Atomic rename
-        tokio::fs::rename(&temp_file, path).await?;
         debug!("Downloaded: {:?}", path);
         return Ok(());
     }

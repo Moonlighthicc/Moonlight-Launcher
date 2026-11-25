@@ -10,3 +10,5 @@ result
 result-*
 target/
 /docs/
+moonlight-launcher.key
+/$(cygpath -w $HOME/

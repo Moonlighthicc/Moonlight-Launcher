@@ -664,6 +664,7 @@ export async function installMrpackWithUpstream(
 	iconUrl?: string,
 	callback?: () => void,
 	onError?: (err: unknown) => void,
+	notifyError = true,
 ): Promise<MrpackInfo | null> {
 	try {
 		const result = await invoke<MrpackInfo>("install_mrpack", {
@@ -676,7 +677,7 @@ export async function installMrpackWithUpstream(
 		callback?.();
 		return result;
 	} catch (err) {
-		if (!isCancelError(err)) showErrorParsed(err);
+		if (notifyError && !isCancelError(err)) showErrorParsed(err);
 		onError?.(err);
 		return null;
 	}
@@ -781,13 +782,8 @@ export async function getModrinthLatestVersions(
 export async function downloadMrpack(
 	url: string,
 	versionId: string,
-): Promise<string | null> {
-	return (
-		(await invokeWithFallback<string>("download_mrpack", {
-			url,
-			versionId,
-		})) ?? null
-	);
+): Promise<string> {
+	return invoke<string>("download_mrpack", { url, versionId });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -912,13 +908,8 @@ export async function searchCurseForgeModpacks(
 export async function downloadCurseForgeModpack(
 	url: string,
 	fileId: number,
-): Promise<string | null> {
-	return (
-		(await invokeWithFallback<string>("download_curseforge_modpack", {
-			url,
-			fileId,
-		})) ?? null
-	);
+): Promise<string> {
+	return invoke<string>("download_curseforge_modpack", { url, fileId });
 }
 
 export async function parseCurseForgeModpack(
@@ -940,6 +931,7 @@ export async function installCurseForgeModpack(
 	iconUrl?: string,
 	callback?: () => void,
 	onError?: (err: unknown) => void,
+	notifyError = true,
 ): Promise<CurseForgeModpackInfo | null> {
 	try {
 		const result = await invoke<CurseForgeModpackInfo>(
@@ -955,7 +947,7 @@ export async function installCurseForgeModpack(
 		callback?.();
 		return result;
 	} catch (err) {
-		if (!isCancelError(err)) showErrorParsed(err);
+		if (notifyError && !isCancelError(err)) showErrorParsed(err);
 		onError?.(err);
 		return null;
 	}

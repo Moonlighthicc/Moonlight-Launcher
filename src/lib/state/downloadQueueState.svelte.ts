@@ -541,11 +541,9 @@ export function loaderVersionId(
 	}
 }
 
-/**
- * Muestra la tarea de inmediato ("Подключение...") mientras el backend la prepara.
- * Cuando llega el evento real, la fila continúa sin duplicarse. Si la operación
- * termina sin entrar en la cola (p. ej. ya instalada), la fila se retira.
- */
+export const pendingVersionDownloads = new SvelteSet<string>();
+
+/** Show a provisional queue row until the backend reports progress. */
 export async function trackConnecting<T>(
 	version: string | null,
 	run: () => Promise<T>,

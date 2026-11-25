@@ -2939,7 +2939,7 @@ dependencies = [
 
 [[package]]
 name = "moonlightlauncher"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "ablage",
  "aqua",

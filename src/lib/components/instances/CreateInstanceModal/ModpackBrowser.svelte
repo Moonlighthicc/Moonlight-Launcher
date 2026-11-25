@@ -69,6 +69,8 @@
 		onSelect,
 		onBack,
 		onInstall,
+		onRetryInstall,
+		onDismissInstall,
 		detailExtra,
 	}: {
 		query?: string;
@@ -82,7 +84,7 @@
 		versionOptions?: PackVersion[];
 		loadingVersions?: boolean;
 		installing?: boolean;
-		installTask?: { archive: string; name: string };
+		installTask?: { archive: string; version: string; name: string; error: string | null };
 		installError?: string | null;
 		gallery?: PackGalleryImage[];
 		website?: string;
@@ -99,6 +101,8 @@
 		onSelect?: (item: ModpackItem) => void;
 		onBack?: () => void;
 		onInstall?: (version: string, name: string) => void;
+		onRetryInstall?: () => void;
+		onDismissInstall?: () => void;
 		detailExtra?: Snippet<[ModpackItem]>;
 	} = $props();
 
@@ -346,6 +350,8 @@
 					description={detailExtra}
 					{onBack}
 					{onInstall}
+					{onRetryInstall}
+					{onDismissInstall}
 					{loaders}
 				/>
 			{/key}

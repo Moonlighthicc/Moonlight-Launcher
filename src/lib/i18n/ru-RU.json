@@ -601,7 +601,8 @@
     "sortDownloads": "По загрузкам",
     "sortNewest": "Новые",
     "downloadingModpack": "Загрузка сборки...",
-    "installingModpack": "Установка сборки...",
+    "installingModpack": "Установка сборки…",
+    "hideDownload": "Продолжить в фоне",
     "installBtn": "Установить",
     "loadMore": "Загрузить ещё",
     "downloads": "загрузок",
@@ -1276,8 +1277,8 @@
       }
     },
     "authorship": {
-      "title": "Авторство",
-      "followUpdates": "Следить за обновлениями можно здесь:",
+      "title": "О лаунчере",
+      "githubReleases": "Релизы на GitHub",
       "website": "Сайт",
       "forkNotice": "MoonlightLauncher — это форк проекта CubicLauncher. Изначально это проект других людей, и все заслуги за оригинальную работу принадлежат им.",
       "originalAuthors": "Оригинальные авторы: Notstaff и Santiagolxx.",

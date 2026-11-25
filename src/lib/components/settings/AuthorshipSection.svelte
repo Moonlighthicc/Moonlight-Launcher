@@ -1,19 +1,31 @@
 <script lang="ts">
+	import type { Snippet } from "svelte";
 	import { t } from "$lib/i18n";
 	import Icon from "$lib/icons/Icon.svelte";
 	import { openUrl } from "$lib/api/cubicApi";
 
-	const SITE_URL = "https://moonlighthicc.space";
+	let { updatePreference, onCheckUpdates }: {
+		updatePreference: Snippet;
+		onCheckUpdates: () => void;
+	} = $props();
+
+	const RELEASES_URL = "https://github.com/Moonlighthicc/Moonlight-Launcher/releases";
 	const ORIGINAL_REPO_URL = "https://github.com/CubicLauncherDevs/CubicLauncher";
 </script>
 
 <div class="authorship">
 	<div class="card follow">
-		<span class="follow-text">{t("settings.authorship.followUpdates")}</span>
-		<button type="button" class="link-btn" onclick={() => openUrl(SITE_URL)}>
-			<Icon name="instance:external-link" size={16} />
-			{t("settings.authorship.website")}
-		</button>
+		<p class="strong">{t("settings.launcher.updatesTitle")}</p>
+		{@render updatePreference()}
+		<div class="update-actions">
+			<button type="button" class="link-btn" onclick={onCheckUpdates}>
+				{t("updater.check")}
+			</button>
+			<button type="button" class="link-btn" onclick={() => openUrl(RELEASES_URL)}>
+				<Icon name="instance:external-link" size={16} />
+				{t("settings.authorship.githubReleases")}
+			</button>
+		</div>
 	</div>
 
 	<div class="card credits">
@@ -47,17 +59,11 @@
 		border-radius: var(--border-radius-sm);
 		background: var(--surface-card);
 	}
-	.follow {
-		flex-direction: row;
+	.update-actions {
+		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
-		justify-content: space-between;
-		gap: 10px 12px;
-	}
-	.follow-text {
-		font-size: 0.8rem;
-		color: var(--text-primary);
-		min-width: 0;
+		gap: 8px;
 	}
 	p {
 		margin: 0;
