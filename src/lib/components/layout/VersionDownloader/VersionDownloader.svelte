@@ -318,17 +318,18 @@
 			} else {
 				const { game_version: mc, display_version: version } =
 					item.loader;
+				const loader = loaderTab;
 				await trackConnecting(
 					id,
 					async () => {
-						if (loaderTab === "fabric") await downloadFabric(mc, version);
-						else if (loaderTab === "quilt")
+						if (loader === "fabric") await downloadFabric(mc, version);
+						else if (loader === "quilt")
 							await downloadQuilt(mc, version);
-						else if (loaderTab === "forge")
+						else if (loader === "forge")
 							await downloadForge(mc, version);
-						else if (loaderTab === "neoforge")
+						else if (loader === "neoforge")
 							await downloadNeoForge(mc, version);
-						else if (loaderTab === "optifine")
+						else if (loader === "optifine")
 							await downloadOptiFine(mc, version);
 					},
 				);

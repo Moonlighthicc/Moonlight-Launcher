@@ -37,6 +37,7 @@ pub enum AppEvent {
         item_total: u64,
         bytes_current: u64,
         bytes_total: u64,
+        transferred_bytes: u64,
         current_item: Option<String>,
     },
     DStage {
@@ -48,6 +49,7 @@ pub enum AppEvent {
         version: Arc<str>,
         /// false para tareas que no admiten cancelación (modpacks, lotes de JRE).
         cancellable: bool,
+        version_download: bool,
     },
     DFinish {
         version: Arc<str>,

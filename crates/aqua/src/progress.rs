@@ -56,6 +56,8 @@ pub struct DownloadProgress {
     pub item_total: usize,
     pub bytes_current: u64,
     pub bytes_total: u64,
+    /// Network bytes, including retries, but never files reused from disk.
+    pub transferred_bytes: u64,
     pub current_item: Option<String>,
     pub current_item_bytes: u64,
     pub current_item_total: Option<u64>,
@@ -69,6 +71,7 @@ impl DownloadProgress {
             item_total,
             bytes_current: 0,
             bytes_total: 0,
+            transferred_bytes: 0,
             current_item: None,
             current_item_bytes: 0,
             current_item_total: None,
@@ -88,6 +91,7 @@ pub struct ProgressState {
     pub bytes_total: AtomicU64,
     pub item_current: AtomicUsize,
     pub bytes_current: AtomicU64,
+    transferred_bytes: AtomicU64,
     pub current_item: StdMutex<Option<String>>,
     pub current_stage: StdMutex<DownloadStage>,
     pub current_item_bytes: AtomicU64,
@@ -135,6 +139,7 @@ impl ProgressState {
             bytes_total: AtomicU64::new(bytes_total),
             item_current: AtomicUsize::new(0),
             bytes_current: AtomicU64::new(0),
+            transferred_bytes: AtomicU64::new(0),
             current_item: StdMutex::new(None),
             current_stage: StdMutex::new(DownloadStage::Verifying),
             current_item_bytes: AtomicU64::new(0),
@@ -181,6 +186,7 @@ impl ProgressState {
             item_total: self.item_total,
             bytes_current: self.bytes_current.load(Ordering::Relaxed),
             bytes_total: self.bytes_total.load(Ordering::Relaxed),
+            transferred_bytes: self.transferred_bytes.load(Ordering::Relaxed),
             current_item: item.map_or_else(|| lock(&self.current_item).clone(), |i| Some(i.name.clone())),
             current_item_bytes: item.map_or_else(|| self.current_item_bytes.load(Ordering::Relaxed), |i| i.bytes.load(Ordering::Relaxed)),
             current_item_total: if current_item_total == 0 {
@@ -264,6 +270,7 @@ impl DownloadReporter {
             .current_item_bytes
             .fetch_add(delta, Ordering::Relaxed);
         self.state.bytes_current.fetch_add(delta, Ordering::Relaxed);
+        self.state.transferred_bytes.fetch_add(delta, Ordering::Relaxed);
     }
 
     /// The server reported the real size (Content-Length). Only corrects the

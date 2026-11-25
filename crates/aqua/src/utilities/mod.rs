@@ -32,6 +32,7 @@ pub static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
 
 const MAX_DOWNLOAD_ATTEMPTS: usize = 6;
 const DOWNLOAD_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn download_retry_delay(attempt: usize, retry_after: u64) -> Duration {
     let backoff = 1 << attempt.saturating_sub(1).min(5);
@@ -317,15 +318,27 @@ async fn download_single_url(
         None
     };
 
-    let temp_file = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temp_file = tempfile::Builder::new()
+        .prefix(".download-")
+        .tempfile_in(parent)?
+        .into_temp_path();
+    let temp_path: &Path = temp_file.as_ref();
+    let can_resume = !expected_hash.is_empty()
+        && max_attempts > 1
+        && !headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("range") || name.eq_ignore_ascii_case("accept-encoding")
+        });
+    let mut offset = 0u64;
+    let mut total = None;
+    let mut hasher = FileHasher::for_hash(expected_hash);
 
     for attempt in 1..=max_attempts {
-        // Clean temp from previous attempts
-        let _ = tokio::fs::remove_file(&temp_file).await;
-
         if let Some(r) = reporter {
             r.connecting();
-            r.reset_attempt();
         }
 
         let mut request = HTTP_CLIENT.get(url);
@@ -341,10 +354,23 @@ async fn download_single_url(
             }
             request = request.headers(header_map);
         }
+        if can_resume {
+            request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        }
+        if offset != 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+        }
         let timeout = if is_mirror { REQUEST_HEADERS_TIMEOUT } else { DOWNLOAD_HEADERS_TIMEOUT };
         let response = match tokio::time::timeout(timeout, request.send()).await {
             Ok(Ok(r)) if r.status().is_success() => r,
             Ok(Ok(r)) => {
+                if offset != 0
+                    && r.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+                    && attempt < max_attempts
+                {
+                    offset = 0;
+                    continue;
+                }
                 // El WAF de BMCLAPI limita por IP: abrimos el circuito y dejamos
                 // que el llamador use el servidor oficial sin reintentar.
                 if is_mirror && r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -388,81 +414,109 @@ async fn download_single_url(
             }
         };
 
+        if offset != 0 && response.status() == reqwest::StatusCode::OK {
+            // Some CDNs ignore Range and return the whole file.
+            offset = 0;
+        }
+        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            let range_total = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| complete_range_total(value, offset));
+            if offset == 0 || range_total.is_none() || (total.is_some() && total != range_total) {
+                if offset != 0 && attempt < max_attempts {
+                    offset = 0;
+                    continue;
+                }
+                return Err(AquaError::Other("Unexpected partial download response".into()));
+            }
+            total = range_total;
+        } else if offset == 0 {
+            total = response.content_length();
+        } else {
+            return Err(AquaError::Other("Unexpected download resume response".into()));
+        }
+
+        if offset == 0 {
+            hasher = FileHasher::for_hash(expected_hash);
+            if let Some(r) = reporter {
+                r.reset_attempt();
+            }
+        }
         if let Some(r) = reporter {
             r.response_ready();
+            if let Some(total) = total {
+                r.learn_total(total);
+            }
         }
 
-        // El tamaño real llega con las cabeceras: se usa solo para corregir el
-        // total esperado. Los bytes se cuentan al recibir el cuerpo, una sola vez.
-        if let (Some(reporter), Some(content_length)) = (reporter, response.content_length()) {
-            reporter.learn_total(content_length);
-        }
-
-        let mut file = match tokio::fs::File::create(&temp_file).await {
-            Ok(f) => f,
-            Err(e) => return Err(AquaError::IoError(e)),
-        };
-
-        let mut hasher = FileHasher::for_hash(expected_hash);
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(offset == 0)
+            .append(offset != 0)
+            .open(temp_path)
+            .await?;
         let mut stream = response.bytes_stream();
 
         use futures::StreamExt;
-        let mut stream_error = None;
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
+        let stream_result = loop {
+            match tokio::time::timeout(DOWNLOAD_STALL_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
                     let len = chunk.len() as u64;
                     hasher.update(&chunk);
-                    if let Err(e) = file.write_all(&chunk).await {
-                        drop(file);
-                        let _ = tokio::fs::remove_file(&temp_file).await;
-                        return Err(AquaError::IoError(e));
-                    }
+                    file.write_all(&chunk).await?;
+                    offset += len;
                     if let Some(r) = reporter {
                         r.report_delta(len);
                     }
                 }
-                Err(e) => {
-                    warn!("Stream error on attempt {}: {}", attempt, e);
-                    stream_error = Some(e);
-                    break;
+                Ok(Some(Err(e))) => break Err(AquaError::RequestError(e)),
+                Err(_) => break Err(AquaError::Other("No download data received for 20 seconds".into())),
+                Ok(None) if total.is_some_and(|total| total != offset) => {
+                    break Err(AquaError::Other("Incomplete download body".into()));
                 }
+                Ok(None) => break Ok(()),
             }
-        }
+        };
 
-        if let Some(error) = stream_error {
-            drop(file);
-            let _ = tokio::fs::remove_file(&temp_file).await;
+        file.flush().await?;
+        drop(file);
+        drop(stream);
+
+        if let Err(error) = stream_result {
+            warn!("Stream error on attempt {attempt}: {error}");
             if attempt == max_attempts {
-                return Err(AquaError::RequestError(error));
+                return Err(error);
+            }
+            if !can_resume || total.is_none_or(|total| offset >= total) {
+                offset = 0;
             }
             tokio::time::sleep(download_retry_delay(attempt, 0)).await;
             continue;
         }
 
-        file.flush().await?;
-        drop(file);
-
         // Verify hash if provided
         if !expected_hash.is_empty() {
-            let actual_hash = hasher.finalize_hex();
+            let actual_hash =
+                std::mem::replace(&mut hasher, FileHasher::for_hash(expected_hash)).finalize_hex();
             if actual_hash != expected_hash {
                 warn!(
                     "Hash mismatch attempt {}/{}: expected={}, got={}",
                     attempt, max_attempts, expected_hash, actual_hash
                 );
-                let _ = tokio::fs::remove_file(&temp_file).await;
                 if attempt == max_attempts {
                     return Err(AquaError::HashMismatch {
                         expected: expected_hash.to_string(),
                         actual: actual_hash,
                     });
                 }
+                offset = 0;
                 continue;
             }
         }
 
-        tokio::fs::rename(&temp_file, path).await?;
+        tokio::fs::rename(temp_path, path).await?;
         if let Some(r) = reporter {
             r.settle();
         }
@@ -471,6 +525,16 @@ async fn download_single_url(
     }
 
     Err(AquaError::Other("Download failed after retries".into()))
+}
+
+fn complete_range_total(value: &str, offset: u64) -> Option<u64> {
+    let (range, total) = value.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let total = total.parse::<u64>().ok()?;
+    (total > offset
+        && start.parse::<u64>().ok() == Some(offset)
+        && end.parse::<u64>().ok() == Some(total - 1))
+        .then_some(total)
 }
 
 /// Lee el cooldown indicado por el servidor en `Retry-After` (o en la variante

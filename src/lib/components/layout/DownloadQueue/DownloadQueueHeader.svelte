@@ -10,12 +10,14 @@
 		open = false,
 		activeCount = 0,
 		doneCount = 0,
+		errorCount = 0,
 		progress = 0,
 		ontoggle,
 	}: {
 		open?: boolean;
 		activeCount?: number;
 		doneCount?: number;
+		errorCount?: number;
 		progress?: number;
 		ontoggle?: () => void;
 	} = $props();
@@ -33,6 +35,8 @@
 		{#if activeCount > 0}
 			<span class="sd-spinner"></span>
 			<span class="sd-label">{t("sidebar.downloading")}</span>
+		{:else if errorCount > 0}
+			<span class="sd-label">{errorCount} · {t("sidebar.failed")}</span>
 		{:else if doneCount > 0}
 			<CheckIcon size={12} color="var(--color-success)" />
 			<span class="sd-label">{doneCount} {t("sidebar.completed")}</span>

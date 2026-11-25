@@ -6,6 +6,7 @@
 		jreVendorFor,
 	} from "$lib/state/state.svelte";
 	import { installJre } from "$lib/api/cubicApi";
+	import { trackConnecting } from "$lib/state/downloadQueueState.svelte";
 	import { launcherStore } from "$lib/state/state.svelte";
 	import { t } from "$lib/i18n";
 	import ModalBase from "$lib/components/layout/ModalBase.svelte";
@@ -25,7 +26,8 @@
 		dismissJreInstallPrompt();
 
 		try {
-			await installJre(jreVersion, jreVendorFor(jreVersion));
+			const vendor = jreVendorFor(jreVersion);
+			await trackConnecting(`jre-${jreVersion}`, () => installJre(jreVersion, vendor));
 		} catch {
 			clearPendingJreLaunch();
 		}

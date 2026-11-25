@@ -197,6 +197,15 @@ async fn abort_cancelled_install(instance_uuid: &str, label: &Arc<str>) -> Strin
     CANCELLED_INSTALL_MESSAGE.to_string()
 }
 
+async fn rollback_failed_install(instance_uuid: &str, label: &Arc<str>, message: String) -> String {
+    let message = match InstanceManager::get().delete_instance(instance_uuid).await {
+        Ok(()) => message,
+        Err(cleanup) => format!("{message}. Could not remove the incomplete instance: {cleanup}"),
+    };
+    DownloadQueue::get().fail_work(label, message.clone());
+    message
+}
+
 async fn install_mrpack_inner(
     path: String,
     instance_name: String,
@@ -288,8 +297,8 @@ async fn install_mrpack_inner(
             drop(files_guard);
             return Err(abort_cancelled_install(&handle.uuid, &download_label).await);
         }
-        DownloadQueue::get().finish_work(&download_label).await;
-        return Err(format!("Failed to install mrpack: {}", e));
+        drop(files_guard);
+        return Err(rollback_failed_install(&handle.uuid, &download_label, format!("Failed to install mrpack: {e}")).await);
     }
 
     crate::services::download_queue::set_tracked_stage(
@@ -297,37 +306,6 @@ async fn install_mrpack_inner(
         "finishing",
         Some("Saving modpack details".to_string()),
     );
-
-    // Download icon from Modrinth if available and set as instance icon
-    let icon = if let Some(url) = icon_url {
-        match reqwest::get(&url).await {
-            Ok(response) => match response.bytes().await {
-                Ok(bytes) => {
-                    let icon_path = instance_dir.join("icon.png");
-                    if let Err(e) = tokio::fs::write(&icon_path, &bytes).await {
-                        tracing::error!("Failed to write icon: {}", e);
-                        None
-                    } else if let Some(icon_str) = icon_path.to_str() {
-                        handle.set_icon(Some(icon_str.to_string())).await;
-                        let _ = files_guard.save_if_dirty().await;
-                        Some(icon_str.to_string())
-                    } else {
-                        None
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to read icon bytes: {}", e);
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::error!("Failed to download icon: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     let source = if project_id.is_some() && modrinth_version_id.is_some() {
         "modrinth"
@@ -343,10 +321,18 @@ async fn install_mrpack_inner(
     )
     .await
     {
-        DownloadQueue::get().finish_work(&download_label).await;
-        return Err(format!("Failed to record mrpack inventory: {}", e));
+        drop(files_guard);
+        return Err(rollback_failed_install(&handle.uuid, &download_label, format!("Failed to record mrpack inventory: {e}")).await);
     }
 
+    let icon = save_optional_pack_icon(icon_url.as_deref(), &instance_dir, &handle).await;
+    if crate::services::download_queue::was_cancel_requested(&download_label) {
+        drop(files_guard);
+        return Err(abort_cancelled_install(&handle.uuid, &download_label).await);
+    }
+    if let Err(e) = files_guard.save_if_dirty().await {
+        tracing::warn!("Could not persist instance icon: {e}");
+    }
     DownloadQueue::get().finish_work(&download_label).await;
 
     emit(AppEvent::InstanceEdited {
@@ -423,20 +409,16 @@ pub async fn parse_curseforge_modpack(path: String) -> Result<CurseForgeModpackI
     curseforge_modpack_info(&path).await
 }
 
-/// Downloads a CurseForge project logo with bounded retries. The logo is
+/// Downloads a project logo with bounded retries. The logo is
 /// optional metadata: transient CDN failures must never fail the modpack install.
-async fn download_curseforge_icon(url: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("MoonlightLauncher")
-        .build()
-        .map_err(|e| format!("Failed to create icon HTTP client: {e}"))?;
-
+async fn download_pack_icon(url: &str) -> Result<Vec<u8>, String> {
+    const MAX_ICON_BYTES: usize = 8 * 1024 * 1024;
     let mut last_error = String::from("unknown error");
     for attempt in 1..=3 {
         let result = async {
-            let response = client
+            let mut response = crate::core::HTTP
                 .get(url)
+                .timeout(std::time::Duration::from_secs(8))
                 .header(
                     reqwest::header::ACCEPT,
                     "image/avif,image/webp,image/png,image/jpeg,image/*",
@@ -451,7 +433,7 @@ async fn download_curseforge_icon(url: &str) -> Result<Vec<u8>, String> {
             }
 
             if let Some(length) = response.content_length()
-                && length > 8 * 1024 * 1024
+                && length > MAX_ICON_BYTES as u64
             {
                 return Err(format!("icon is too large ({length} bytes)"));
             }
@@ -462,13 +444,15 @@ async fn download_curseforge_icon(url: &str) -> Result<Vec<u8>, String> {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.to_ascii_lowercase().starts_with("image/"));
 
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| format!("failed to read response: {e}"))?;
-
-            if bytes.is_empty() || bytes.len() > 8 * 1024 * 1024 {
-                return Err(format!("invalid icon size: {} bytes", bytes.len()));
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|e| format!("failed to read response: {e}"))? {
+                if bytes.len() + chunk.len() > MAX_ICON_BYTES {
+                    return Err("icon is too large".into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if bytes.is_empty() {
+                return Err("empty icon".into());
             }
 
             let has_image_signature = bytes.starts_with(b"\x89PNG\r\n\x1a\n")
@@ -481,7 +465,7 @@ async fn download_curseforge_icon(url: &str) -> Result<Vec<u8>, String> {
                 return Err("response does not contain a recognized image".into());
             }
 
-            Ok(bytes.to_vec())
+            Ok(bytes)
         }
         .await;
 
@@ -493,7 +477,7 @@ async fn download_curseforge_icon(url: &str) -> Result<Vec<u8>, String> {
                     attempt,
                     max_attempts = 3,
                     error = %last_error,
-                    "CurseForge icon download attempt failed"
+                    "Modpack icon download attempt failed"
                 );
                 if attempt < 3 {
                     tokio::time::sleep(std::time::Duration::from_millis(350 * attempt as u64))
@@ -504,6 +488,39 @@ async fn download_curseforge_icon(url: &str) -> Result<Vec<u8>, String> {
     }
 
     Err(last_error)
+}
+
+async fn save_optional_pack_icon(
+    url: Option<&str>,
+    instance_dir: &std::path::Path,
+    handle: &crate::services::InstanceHandle,
+) -> Option<String> {
+    let icon_path = instance_dir.join("icon.png");
+    if let Some(url) = url {
+        let result = async {
+            let bytes = download_pack_icon(url).await?;
+            let root = instance_dir.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                zellkern::path_security::ConfinedDir::open(&root)
+                    .and_then(|root| root.write(std::path::Path::new("icon.png"), &bytes))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!("Could not save optional modpack icon: {e}");
+        }
+    }
+    // Fall back to the logo extracted from the archive if the CDN is unavailable.
+    if !tokio::fs::symlink_metadata(&icon_path).await.ok()?.is_file() {
+        return None;
+    }
+    let icon = icon_path.to_string_lossy().into_owned();
+    handle.set_icon(Some(icon.clone())).await;
+    Some(icon)
 }
 
 #[tauri::command]
@@ -617,12 +634,8 @@ async fn install_curseforge_modpack_inner(
             drop(files_guard);
             return Err(abort_cancelled_install(&handle.uuid, &download_label).await);
         }
-        DownloadQueue::get().finish_work(&download_label).await;
         drop(files_guard);
-        if let Err(cleanup) = manager.delete_instance(&handle.uuid).await {
-            tracing::error!("Failed to roll back CurseForge instance: {cleanup}");
-        }
-        return Err(format!("Failed to install CurseForge modpack: {}", e));
+        return Err(rollback_failed_install(&handle.uuid, &download_label, format!("Failed to install CurseForge modpack: {e}")).await);
     }
 
     crate::services::download_queue::set_tracked_stage(
@@ -630,42 +643,6 @@ async fn install_curseforge_modpack_inner(
         "finishing",
         Some("Saving modpack details".to_string()),
     );
-
-    // The CurseForge logo is optional. Retry transient CDN/network failures,
-    // but never fail the actual modpack installation because its icon is unavailable.
-    let icon = if let Some(url) = icon_url.as_deref() {
-        match download_curseforge_icon(url).await {
-            Ok(bytes) => {
-                let icon_path = instance_dir.join("icon.png");
-                match zellkern::path_security::ConfinedDir::open(&instance_dir)
-                    .and_then(|root| root.write(std::path::Path::new("icon.png"), &bytes))
-                {
-                    Ok(()) => {
-                        if let Some(icon_str) = icon_path.to_str() {
-                            handle.set_icon(Some(icon_str.to_string())).await;
-                            let _ = files_guard.save_if_dirty().await;
-                            Some(icon_str.to_string())
-                        } else {
-                            None
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to save CurseForge icon: {}", e);
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Could not download CurseForge icon after retries; continuing without it: {}",
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     let source = if project_id.is_some() && file_id.is_some() {
         "curseforge"
@@ -681,13 +658,18 @@ async fn install_curseforge_modpack_inner(
     )
     .await
     {
-        DownloadQueue::get().finish_work(&download_label).await;
-        return Err(format!(
-            "Failed to record CurseForge modpack inventory: {}",
-            e
-        ));
+        drop(files_guard);
+        return Err(rollback_failed_install(&handle.uuid, &download_label, format!("Failed to record CurseForge modpack inventory: {e}")).await);
     }
 
+    let icon = save_optional_pack_icon(icon_url.as_deref(), &instance_dir, &handle).await;
+    if crate::services::download_queue::was_cancel_requested(&download_label) {
+        drop(files_guard);
+        return Err(abort_cancelled_install(&handle.uuid, &download_label).await);
+    }
+    if let Err(e) = files_guard.save_if_dirty().await {
+        tracing::warn!("Could not persist instance icon: {e}");
+    }
     DownloadQueue::get().finish_work(&download_label).await;
 
     emit(AppEvent::InstanceEdited {

@@ -11,7 +11,7 @@
 		isCancelError,
 		openUrl,
 	} from "$lib/api/cubicApi";
-	import { trackConnecting } from "$lib/state/downloadQueueState.svelte";
+	import { clearModpackDownloadErrors, trackConnecting } from "$lib/state/downloadQueueState.svelte";
 	import { dismissModpackInstall, modpackInstalls, retryModpackInstall, runModpackInstall } from "$lib/state/modpackInstalls.svelte";
 	import type {
 		CurseForgeProject,
@@ -419,8 +419,8 @@
 			}
 			if (!url) throw new Error("No download URL found for this modpack");
 
-			const packPath = await trackConnecting(archive, () =>
-				downloadCurseForgeModpack(url, file.id),
+			const packPath = await trackConnecting(archive,
+				() => downloadCurseForgeModpack(url, file.id), null,
 			);
 			const result = await installCurseForgeModpack(
 				packPath,
@@ -445,11 +445,13 @@
 		if (!task || task.error === null || !selectedItem) return;
 		const { id } = selectedItem;
 		const { name } = task;
+		clearModpackDownloadErrors(task);
 		if (!(await retryModpackInstall(`curseforge:${id}`))) onInstallFailed?.(name);
 		else if (alive && selectedItem?.id === id) onInstalled?.();
 	}
 
 	function dismissInstall() {
+		if (task?.error) clearModpackDownloadErrors(task);
 		if (selectedItem) dismissModpackInstall(`curseforge:${selectedItem.id}`);
 	}
 

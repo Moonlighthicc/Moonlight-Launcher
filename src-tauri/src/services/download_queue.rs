@@ -34,6 +34,9 @@ pub struct DownloadState {
     pub item_total: u64,
     pub bytes_current: u64,
     pub bytes_total: u64,
+    pub transferred_bytes: u64,
+    pub cancellable: bool,
+    pub version_download: bool,
     pub current_item: Option<String>,
 }
 
@@ -47,6 +50,9 @@ impl DownloadState {
             item_total: 0,
             bytes_current: 0,
             bytes_total: 0,
+            transferred_bytes: 0,
+            cancellable: true,
+            version_download: true,
             current_item: None,
         }
     }
@@ -174,10 +180,11 @@ impl DownloadQueue {
         emit(AppEvent::DEnqueue {
             version: version.clone(),
             cancellable: true,
+            version_download: true,
         });
 
-        if let Err(e) = self.sender.send(version).await {
-            error!("Failed to enqueue download: {}", e);
+        if self.sender.send(version.clone()).await.is_err() {
+            self.fail_work(&version, "Download worker is unavailable".into());
         }
     }
 
@@ -190,7 +197,7 @@ impl DownloadQueue {
             .map(|r| r.key().clone())
             .collect();
         for key in done {
-            if let Some((k, state)) = self.active.remove(&key) {
+            if let Some((k, state)) = self.active.remove_if(&key, |_, state| !state.is_active()) {
                 self.finished.insert(k, (state, std::time::Instant::now()));
             }
         }
@@ -239,6 +246,9 @@ impl DownloadQueue {
                 item_total: 0,
                 bytes_current: 0,
                 bytes_total: 0,
+                transferred_bytes: 0,
+                cancellable,
+                version_download: false,
                 current_item: None,
             },
         );
@@ -252,6 +262,7 @@ impl DownloadQueue {
         emit(AppEvent::DEnqueue {
             version: label,
             cancellable,
+            version_download: false,
         });
     }
 
@@ -360,8 +371,11 @@ impl DownloadQueue {
 
         self.pending_batches
             .insert(version.clone(), (batch, shared_guard));
-        self.active
-            .insert(version.clone(), DownloadState::new(version.clone()));
+        self.active.insert(version.clone(), DownloadState {
+            cancellable: false,
+            version_download: false,
+            ..DownloadState::new(version.clone())
+        });
         self.uncancellable.insert(version.clone(), ());
         self.cancel_requests.remove(&version);
         self.finished.remove(&version);
@@ -369,10 +383,12 @@ impl DownloadQueue {
         emit(AppEvent::DEnqueue {
             version: version.clone(),
             cancellable: false,
+            version_download: false,
         });
 
-        if let Err(e) = self.sender.send(version).await {
-            error!("Failed to enqueue batch: {}", e);
+        if self.sender.send(version.clone()).await.is_err() {
+            self.pending_batches.remove(&version);
+            self.fail_work(&version, "Download worker is unavailable".into());
         }
     }
 
@@ -388,9 +404,24 @@ impl DownloadQueue {
         self.prune();
     }
 
+    pub(crate) fn fail_work(&self, label: &Arc<str>, message: String) {
+        self.release(label);
+        emit_and_set_error(self, label, message);
+        self.prune();
+    }
+
     async fn worker(mut rx: mpsc::Receiver<Arc<str>>, queue: Arc<DownloadQueue>) {
         while let Some(version) = rx.recv().await {
-            Self::process_version(&queue, version).await;
+            let task_queue = queue.clone();
+            let task_version = version.clone();
+            if let Err(error) = tokio::spawn(async move {
+                Self::process_version(&task_queue, task_version).await;
+            })
+            .await
+            {
+                queue.pending_batches.remove(&version);
+                queue.fail_work(&version, format!("Download worker failed: {error}"));
+            }
         }
 
         error!("Download worker terminated unexpectedly — the channel was closed");
@@ -426,24 +457,17 @@ impl DownloadQueue {
             match dl_result {
                 Ok(_) => {
                     info!("Batch {} completed successfully", version);
-                    if let Some(mut state) = queue.active.get_mut(&version) {
-                        state.status = DownloadStatus::Done;
-                    }
-                    emit(AppEvent::DFinish {
-                        version: version.clone(),
-                    });
+                    queue.finish_work(&version).await;
                     emit(AppEvent::JREChanged);
                 }
                 Err(e) => {
-                    emit_and_set_error(
-                        queue,
+                    queue.fail_work(
                         &version,
                         format!("Could not complete batch {}: {:?}", version, e),
                     );
                 }
             }
 
-            queue.prune();
             return;
         }
 
@@ -762,13 +786,13 @@ pub(crate) fn finish_cancelled_work(label: &Arc<str>) {
 
 fn emit_and_set_error(queue: &DownloadQueue, version: &Arc<str>, msg: String) {
     error!("{}", msg);
+    if let Some(mut state) = queue.active.get_mut(version) {
+        state.status = DownloadStatus::Error(msg.clone());
+    }
     emit(AppEvent::DError {
         version: version.clone(),
         message: CompactString::from(&*msg),
     });
-    if let Some(mut state) = queue.active.get_mut(version) {
-        state.status = DownloadStatus::Error(msg);
-    }
 }
 
 fn emit_stage(version: &Arc<str>, stage: &'static str, info: Option<String>) {
@@ -789,6 +813,10 @@ pub(crate) fn set_tracked_stage(
     if let Some(mut state) = DownloadQueue::get().active.get_mut(version) {
         state.stage = Cow::Borrowed(stage);
         state.current_item = info.clone();
+        state.item_current = 0;
+        state.item_total = 0;
+        state.bytes_current = 0;
+        state.bytes_total = 0;
     }
     emit_stage(version, stage, info);
 }
@@ -892,13 +920,21 @@ pub(crate) async fn monitor_download_progress(
     mut progress_rx: watch::Receiver<DownloadProgress>,
     queue: Arc<DownloadQueue>,
 ) {
-    let mut last_stage: Option<String> = None;
+    let mut previous = None;
+    let mut batch_bytes = 0;
 
     loop {
         if progress_rx.changed().await.is_err() {
             break;
         }
-        let progress = progress_rx.borrow().clone();
+        let progress = progress_rx.borrow_and_update().clone();
+        if previous.as_ref() == Some(&progress) {
+            continue;
+        }
+        let delta = progress.transferred_bytes.saturating_sub(batch_bytes);
+        batch_bytes = batch_bytes.max(progress.transferred_bytes);
+        let stage_changed = previous.as_ref().is_none_or(|p: &DownloadProgress| p.stage != progress.stage);
+        let transferred_bytes;
 
         if let Some(mut state) = queue.active.get_mut(&version) {
             state.stage = Cow::Borrowed(progress.stage.as_str());
@@ -906,10 +942,13 @@ pub(crate) async fn monitor_download_progress(
             state.item_total = progress.item_total as u64;
             state.bytes_current = progress.bytes_current;
             state.bytes_total = progress.bytes_total;
+            state.transferred_bytes += delta;
+            transferred_bytes = state.transferred_bytes;
             state.current_item = progress.current_item.clone();
+        } else {
+            break;
         }
 
-        let stage_str = progress.stage.as_str().to_string();
         let current_item = progress.current_item.clone();
 
         emit(AppEvent::DProgress {
@@ -919,17 +958,18 @@ pub(crate) async fn monitor_download_progress(
             item_total: progress.item_total as u64,
             bytes_current: progress.bytes_current,
             bytes_total: progress.bytes_total,
+            transferred_bytes,
             current_item,
         });
 
-        if last_stage.as_ref() != Some(&stage_str) {
+        if stage_changed {
             emit(AppEvent::DStage {
                 version: version.clone(),
                 stage: Cow::Borrowed(progress.stage.as_str()),
-                info: progress.current_item,
+                info: progress.current_item.clone(),
             });
-            last_stage = Some(stage_str);
         }
+        previous = Some(progress);
     }
 }
 

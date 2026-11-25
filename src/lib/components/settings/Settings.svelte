@@ -24,9 +24,11 @@
 	import {
 		getJreVersions,
 		installJre,
+		openUrl,
 		uninstallJre,
 		getAvailableJreVendors,
 	} from "$lib/api/cubicApi";
+	import { trackConnecting } from "$lib/state/downloadQueueState.svelte";
 	import type { JreStatus, ThemeEntry } from "$lib/types/types";
 	import AuthorshipSection from "./AuthorshipSection.svelte";
 	import CollapsibleSection from "./CollapsibleSection.svelte";
@@ -103,7 +105,8 @@
 		if (jreActionStates[version]) return;
 		jreActionStates[version] = "downloading";
 		try {
-			await installJre(version, jreVendorFor(version));
+			const vendor = jreVendorFor(version);
+			await trackConnecting(`jre-${version}`, () => installJre(version, vendor));
 		} catch (e) {
 			console.error(`Failed to queue JRE ${version}:`, e);
 			jreActionStates[version] = undefined;

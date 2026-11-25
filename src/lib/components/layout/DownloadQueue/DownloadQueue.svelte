@@ -9,9 +9,14 @@
 		getOverallPct,
 		getStatusLabel,
 		cancelDownloadTask,
+		retryDownloadTask,
+		dismissDownloadError,
+		clearModpackDownloadErrors,
+		matchesModpackDownloadError,
 		downloadQueueUi,
 	} from "$lib/state/downloadQueueState.svelte";
 	import DownloadQueueHeader from "./DownloadQueueHeader.svelte";
+	import { dismissModpackInstall, modpackInstalls, retryModpackInstall } from "$lib/state/modpackInstalls.svelte";
 	import DownloadQueueItem from "./DownloadQueueItem.svelte";
 	import ChevronDownIcon from "$lib/icons/ChevronDownIcon.svelte";
 	import { animDuration } from "$lib/utils/animations";
@@ -93,6 +98,11 @@
 	let open = $derived(downloadQueueUi.expanded);
 	let activeCount = $derived(getActiveDownloadCount());
 	let doneCount = $derived(getDoneDownloadCount());
+	let packFailures = $derived([...modpackInstalls].filter(([, task]) => task.error !== null));
+	let queueItems = $derived([...downloads.values()].filter((item) =>
+		!packFailures.some(([, task]) => matchesModpackDownloadError(item, task))));
+	let errorCount = $derived(queueItems.filter((item) => item.error).length + packFailures.length);
+
 	let activeProgress = $derived.by(() => {
 		const active = [...downloads.values()].filter((item) => !item.done && !item.error);
 		if (active.length === 0) return 0;
@@ -133,6 +143,7 @@
 		{open}
 		{activeCount}
 		{doneCount}
+		{errorCount}
 		progress={activeProgress}
 		ontoggle={toggleQueue}
 	/>
@@ -157,10 +168,10 @@
 					</button>
 				</div>
 			{/if}
-			{#if downloads.size === 0}
+			{#if queueItems.length === 0 && packFailures.length === 0}
 				<div class="sd-empty">{t("sidebar.noDownloadDesc")}</div>
 			{:else}
-				{#each [...downloads.values()] as item (item.version)}
+				{#each queueItems as item (item.version)}
 					{@const overall = getOverallPct(item)}
 					{@const label = item.deleting ? t("sidebar.cancelDeleting") : item.cancelling
 						? t("sidebar.cancelling")
@@ -176,11 +187,26 @@
 						bytesCurrent={item.bytesCurrent ?? 0}
 						bytesTotal={item.bytesTotal ?? 0}
 						speedBytesPerSecond={item.speedBytesPerSecond ?? 0}
+						speedHistory={item.speedHistory}
 						currentItem={item.currentItem ?? null}
 						itemProgress={item.activeType && !item.bytesTotal ? item.segs[item.activeType] : undefined}
 						cancellable={item.cancellable !== false}
 						cancelling={item.cancelling === true}
 						onCancel={() => void cancelDownloadTask(item.version)}
+						onRetry={item.error && item.retry ? () => void retryDownloadTask(item.version) : undefined}
+						onDismiss={item.error ? () => dismissDownloadError(item.version) : undefined}
+					/>
+				{/each}
+				{#each packFailures as [key, task] (key)}
+					<DownloadQueueItem
+						version={task.archive}
+						name={task.name}
+						overall={0}
+						done={true}
+						error={task.error}
+						statusLabel={null}
+						onRetry={() => { clearModpackDownloadErrors(task); void retryModpackInstall(key); }}
+						onDismiss={() => { clearModpackDownloadErrors(task); dismissModpackInstall(key); }}
 					/>
 				{/each}
 			{/if}

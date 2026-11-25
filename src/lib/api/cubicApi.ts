@@ -384,7 +384,7 @@ export async function refreshAvailableVersions(): Promise<MinecraftVersion[]> {
 }
 
 export async function addToQueue(version: string): Promise<void> {
-	return invokeVoid("add_to_queue", { version });
+	return invokeThrowing("add_to_queue", { version });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1324,6 +1324,9 @@ export interface DownloadSnapshotItem {
 	item_total: number;
 	bytes_current: number;
 	bytes_total: number;
+	transferred_bytes: number;
+	cancellable: boolean;
+	version_download: boolean;
 	current_item?: string | null;
 }
 
@@ -1331,12 +1334,11 @@ export interface DownloadSnapshotItem {
 export async function getDownloadSnapshot(): Promise<
 	DownloadSnapshotItem[] | null
 > {
-	return (
-		(await invokeWithFallback<DownloadSnapshotItem[]>(
-			"get_download_snapshot",
-			null,
-		)) ?? null
-	);
+	try {
+		return await invoke<DownloadSnapshotItem[]>("get_download_snapshot");
+	} catch {
+		return null;
+	}
 }
 
 export async function resolveModDependencies(

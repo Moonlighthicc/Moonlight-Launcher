@@ -173,6 +173,7 @@ fn send_progress(
             item_total,
             bytes_current,
             bytes_total,
+            transferred_bytes: 0,
             current_item: current_item.clone(),
             current_item_bytes: bytes_current,
             current_item_total: if bytes_total == 0 {
@@ -190,8 +191,9 @@ struct WatchReporter {
     tx: ProgressSender,
     stage: DownloadStage,
     label: String,
-    total: u64,
+    total: AtomicU64,
     bytes: AtomicU64,
+    transferred: AtomicU64,
     last_reported: AtomicU64,
 }
 
@@ -201,26 +203,29 @@ impl WatchReporter {
             tx,
             stage,
             label,
-            total,
+            total: AtomicU64::new(total),
             bytes: AtomicU64::new(0),
+            transferred: AtomicU64::new(0),
             last_reported: AtomicU64::new(0),
         }
     }
 
     fn emit(&self) {
         let current = self.bytes.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
         let _ = self.tx.send(DownloadProgress {
             stage: self.stage.clone(),
             item_current: 0,
             item_total: 1,
             bytes_current: current,
-            bytes_total: self.total,
+            bytes_total: total,
+            transferred_bytes: self.transferred.load(Ordering::Relaxed),
             current_item: Some(self.label.clone()),
             current_item_bytes: current,
-            current_item_total: if self.total == 0 {
+            current_item_total: if total == 0 {
                 None
             } else {
-                Some(self.total)
+                Some(total)
             },
         });
     }
@@ -232,11 +237,20 @@ impl ProgressReporter for WatchReporter {
         self.last_reported.store(0, Ordering::Relaxed);
     }
 
+    fn learn_total(&self, size: u64) {
+        self.total.store(size, Ordering::Relaxed);
+    }
+
+    fn settle(&self) {
+        self.emit();
+    }
+
     fn report_delta(&self, delta: u64) {
         if delta == 0 {
             return;
         }
         let new = self.bytes.fetch_add(delta, Ordering::Relaxed) + delta;
+        self.transferred.fetch_add(delta, Ordering::Relaxed);
         if new.saturating_sub(self.last_reported.load(Ordering::Relaxed)) >= 256 * 1024 {
             self.last_reported.store(new, Ordering::Relaxed);
             self.emit();

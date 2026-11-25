@@ -1,8 +1,9 @@
 import { SvelteMap, SvelteSet } from "svelte/reactivity";
 import {
+	addToQueue,
 	cancelDownload,
-	getDownloadQueue,
 	getDownloadSnapshot,
+	isCancelError,
 } from "$lib/api/cubicApi";
 import { onAppEvent } from "$lib/api/launcherService";
 import { t } from "$lib/i18n";
@@ -38,7 +39,10 @@ export interface DownloadQueueItem {
 	bytesCurrent?: number;
 	bytesTotal?: number;
 	speedBytesPerSecond?: number;
-	speedSample?: { stage: SegKey; bytes: number; at: number };
+	speedHistory?: number[];
+	transferredBytes?: number;
+	speedSample?: { bytes: number; at: number };
+	retry?: () => Promise<unknown>;
 	/** false para tareas que el backend no puede cancelar (modpacks, lotes de JRE). */
 	cancellable?: boolean;
 	/** true mientras se espera la respuesta del backend (aún sin entrar en la cola). */
@@ -71,7 +75,7 @@ function emptySegs(): Record<SegKey, SegProg> {
  * Al recibirlas la barra vuelve a "sin datos" en vez de conservar el lote anterior.
  */
 const BATCH_RESET_STAGES = new Set(["pending", "resolving", "mc", "jre"]);
-const SPEED_SAMPLE_MS = 2500;
+const SPEED_SAMPLE_MS = 1000;
 
 function resetBatchFields(item: DownloadQueueItem): DownloadQueueItem {
 	return {
@@ -79,8 +83,6 @@ function resetBatchFields(item: DownloadQueueItem): DownloadQueueItem {
 		segs: emptySegs(),
 		bytesCurrent: 0,
 		bytesTotal: 0,
-		speedBytesPerSecond: 0,
-		speedSample: undefined,
 		currentItem: null,
 	};
 }
@@ -157,21 +159,77 @@ export function getDownloadQueueItems(): DownloadQueueItem[] {
 function sampleDownloadSpeeds(): void {
 	const now = performance.now();
 	for (const [version, item] of downloads) {
-		const stage = item.activeType;
-		if (item.done || item.error || item.deleting || !stage || !item.bytesTotal ||
-			!hasWorkStarted(stage.toLowerCase(), true)) continue;
-		const bytes = item.bytesCurrent ?? 0;
+		if (item.done || item.error || item.deleting || item.transferredBytes === undefined) continue;
+		const bytes = item.transferredBytes;
 		const previous = item.speedSample;
-		const sameBatch = previous && previous.stage === stage && bytes >= previous.bytes;
-		const elapsed = sameBatch ? now - previous.at : 0;
-		// Avoid showing a noisy first reading when a download starts just before the tick.
-		if (sameBatch && elapsed < 1000) continue;
+		const speed = previous && now > previous.at
+			? Math.max(0, bytes - previous.bytes) * 1000 / (now - previous.at)
+			: 0;
+		if (!speed && !item.speedHistory) {
+			if (previous) downloads.set(version, { ...item, speedSample: { bytes, at: now } });
+			continue;
+		}
 		downloads.set(version, {
 			...item,
-			speedBytesPerSecond: sameBatch ? (bytes - previous.bytes) * 1000 / elapsed : 0,
-			speedSample: { stage, bytes, at: now },
+			speedBytesPerSecond: speed,
+			speedHistory: [...(item.speedHistory ?? []), speed].slice(-24),
+			speedSample: { bytes, at: now },
 		});
 	}
+}
+
+function pendingItem(version: string): DownloadQueueItem {
+	return { version, activeType: null, segs: emptySegs(), done: false, error: null };
+}
+
+function retryVersion(version: string, enabled?: boolean): (() => Promise<void>) | undefined {
+	return enabled ? () => addToQueue(version) : undefined;
+}
+
+function markDownloadFailed(version: string, message: string): void {
+	failedVersions.add(version);
+	const item = downloads.get(version) ?? pendingItem(version);
+	downloads.set(version, {
+		...item,
+		done: true,
+		activeType: null,
+		error: message || t("sidebar.failed"),
+		connecting: false,
+		cancelling: false,
+		deleting: false,
+	});
+}
+
+export function dismissDownloadError(version: string): void {
+	if (downloads.get(version)?.error) downloads.delete(version);
+}
+
+export function clearModpackDownloadErrors(task: { archive: string; error: string | null }): void {
+	for (const item of downloads.values()) {
+		if (matchesModpackDownloadError(item, task)) dismissDownloadError(item.version);
+	}
+}
+
+export function matchesModpackDownloadError(item: DownloadQueueItem, task: { archive: string; error: string | null }): boolean {
+	return !!item.error && (item.version === task.archive ||
+		(item.version.startsWith("modpack-") && item.error === task.error));
+}
+
+export async function retryDownloadTask(version: string): Promise<void> {
+	const item = downloads.get(version);
+	if (!item?.error || !item.retry) return;
+	try {
+		await trackConnecting(version, item.retry);
+	} catch {
+		// trackConnecting retains the new failure on the row.
+	}
+}
+
+function withTransfer(item: DownloadQueueItem, bytes: number): Partial<DownloadQueueItem> {
+	return {
+		transferredBytes: bytes,
+		speedSample: item.speedSample ?? { bytes: 0, at: performance.now() },
+	};
 }
 
 function removeDownload(version: string, delay: number): void {
@@ -189,48 +247,51 @@ function removeDownload(version: string, delay: number): void {
  * local con la del backend y se corrige cualquier diferencia: etapa, progreso,
  * finalización y errores.
  */
-async function syncWithBackend(): Promise<void> {
+async function syncWithBackend(force = false): Promise<void> {
 	if (pollInFlight || destroyed) return;
 	// Nada que vigilar: no molestar al backend.
 	const hasPending = [...downloads.values()].some(
-		(d) => !d.done && !d.error && !d.connecting,
+		(d) => !d.done && !d.error,
 	);
-	if (!hasPending) return;
+	if (!hasPending && !force) return;
 	pollInFlight = true;
+	const before = new Map(downloads);
 	try {
 		const snapshot = await getDownloadSnapshot();
 		if (destroyed || !snapshot) return;
 		const remote = new Map(snapshot.map((r) => [r.version, r]));
 
 		for (const [version, item] of [...downloads.entries()]) {
-			if (item.connecting || item.done || item.error || item.deleting) continue;
+			if (item.done || item.error || item.deleting) continue;
+			if (before.get(version) !== item) continue;
 			const r = remote.get(version);
 
 			if (!r) {
-				// El backend ya no la conoce ni como activa ni como terminada:
-				// cancelada (o resultado caducado). Se retira de la lista.
-				downloads.delete(version);
+				// An enqueue may arrive after the snapshot was taken.
+				if (item.cancelling) downloads.delete(version);
 				continue;
 			}
 
 			const status = r.status;
+			// A provisional row can still be waiting to enqueue a new attempt.
+			if (item.connecting && status !== "pending" && status !== "downloading") continue;
+			const fromBackend = {
+				connecting: false,
+				cancellable: r.cancellable,
+				retry: item.retry ?? retryVersion(version, r.version_download),
+			};
 			if (status === "done") {
 				failedVersions.delete(version);
 				downloads.set(version, { ...item, done: true, activeType: null });
 				removeDownload(version, 4000);
 			} else if (typeof status === "object" && status && "error" in status) {
-				failedVersions.add(version);
-				downloads.set(version, {
-					...item,
-					done: true,
-					activeType: null,
-					error: status.error ?? null,
-				});
-				removeDownload(version, 8000);
+				downloads.set(version, { ...item, ...fromBackend });
+				markDownloadFailed(version, status.error);
 			} else if (r.stage === "pending") {
 				// Entre lotes: sin progreso conocido, no se conserva el lote anterior.
 				downloads.set(version, {
 					...resetBatchFields(item),
+					...fromBackend,
 					activeType: null,
 				});
 			} else if (r.stage && r.stage !== "downloading") {
@@ -240,19 +301,22 @@ async function syncWithBackend(): Promise<void> {
 				const total = useBytes ? r.bytes_total : r.item_total;
 				const prev = item.segs[key];
 				// No retroceder el progreso si un evento más reciente ya lo avanzó.
-				if (item.activeType === key && prev.total === total && prev.current > current) {
+				if (r.transferred_bytes < (item.transferredBytes ?? 0) ||
+					(item.activeType === key && prev.total === total && prev.current > current)) {
 					continue;
 				}
 				downloads.set(version, {
 					...item,
+					...fromBackend,
+					...withTransfer(item, r.transferred_bytes),
 					segs: { ...item.segs, [key]: { current, total } },
 					currentItem: r.current_item ?? (item.activeType === key ? item.currentItem : null) ?? null,
-					bytesCurrent: r.bytes_total > 0 ? r.bytes_current : 0,
+					bytesCurrent: r.bytes_current,
 					bytesTotal: r.bytes_total > 0 ? r.bytes_total : 0,
 					activeType: key,
 					started: item.started || hasWorkStarted(r.stage, true),
 				});
-			}
+			} else if (item.connecting) downloads.set(version, { ...item, ...fromBackend });
 		}
 
 		// Tareas activas que la UI aún no conoce (evento DEnqueue perdido).
@@ -278,9 +342,11 @@ async function syncWithBackend(): Promise<void> {
 				currentItem: r.current_item ?? null,
 				bytesCurrent: r.bytes_current,
 				bytesTotal: r.bytes_total,
+				...withTransfer(pendingItem(r.version), r.transferred_bytes),
 				done: false,
 				error: null,
-				cancellable: true,
+				cancellable: r.cancellable,
+				retry: retryVersion(r.version, r.version_download),
 			});
 		}
 	} catch {
@@ -304,31 +370,19 @@ export function initDownloadQueueState(): void {
 		document.addEventListener("visibilitychange", onResync);
 	}
 
-	getDownloadQueue().then((queue) => {
-		if (destroyed) return;
-		for (const item of queue) {
-			if (!downloads.has(item.version)) {
-				downloads.set(item.version, {
-					version: item.version,
-					activeType: null,
-					segs: emptySegs(),
-					done: item.status === "done",
-					error: null,
-				});
-			}
-		}
-	});
-
 	unsubs.push(
 		onAppEvent("DEnqueue", (payload) => {
-			const { version, cancellable } = payload.data as {
+			const { version, cancellable, version_download } = payload.data as {
 				version: string;
 				cancellable?: boolean;
+				version_download?: boolean;
 			};
 			const existing = downloads.get(version);
+			failedVersions.delete(version);
 			if (existing && !existing.done && !existing.error) {
 				downloads.set(version, {
 					...existing,
+					retry: existing.retry ?? retryVersion(version, version_download),
 					cancellable: cancellable !== false,
 					connecting: false,
 				});
@@ -340,6 +394,7 @@ export function initDownloadQueueState(): void {
 				segs: emptySegs(),
 				done: false,
 				error: null,
+				retry: retryVersion(version, version_download),
 				cancellable: cancellable !== false,
 				connecting: false,
 			});
@@ -355,6 +410,7 @@ export function initDownloadQueueState(): void {
 				item_total,
 				bytes_current,
 				bytes_total,
+				transferred_bytes,
 				current_item,
 			} = payload.data as {
 				version: string;
@@ -363,6 +419,7 @@ export function initDownloadQueueState(): void {
 				item_total: number;
 				bytes_current: number;
 				bytes_total: number;
+				transferred_bytes: number;
 				current_item?: string | null;
 			};
 			const existing = downloads.get(version) ?? {
@@ -373,24 +430,18 @@ export function initDownloadQueueState(): void {
 				error: null,
 			};
 			const key = normalizeStage(stage);
+			if (existing.done) return;
 			const currentItem = current_item?.trim() || null;
 			const useBytes = bytes_total > 0;
 			const current = useBytes ? bytes_current : item_current;
 			const total = useBytes ? bytes_total : item_total;
-			const canSample = useBytes && hasWorkStarted(stage, true);
-			const previous = existing.speedSample;
-			const sameBatch = canSample && previous?.stage === key &&
-				bytes_current >= (existing.bytesCurrent ?? previous.bytes);
-			const speedSample = sameBatch ? previous : canSample
-				? { stage: key, bytes: bytes_current, at: performance.now() }
-				: undefined;
 			downloads.set(version, {
 				...existing,
+				...withTransfer(existing, transferred_bytes),
+				connecting: false,
 				currentItem,
-				bytesCurrent: useBytes ? bytes_current : 0,
+				bytesCurrent: bytes_current,
 				bytesTotal: useBytes ? bytes_total : 0,
-				speedBytesPerSecond: sameBatch ? existing.speedBytesPerSecond : 0,
-				speedSample,
 				segs: { ...existing.segs, [key]: { current, total } },
 				activeType: key,
 				started: existing.started || hasWorkStarted(stage, true),
@@ -408,8 +459,9 @@ export function initDownloadQueueState(): void {
 				info?: string | null;
 			};
 			const existing = downloads.get(version);
-			if (existing) {
-				const base = BATCH_RESET_STAGES.has(stage)
+			if (existing && !existing.done) {
+				const base = (BATCH_RESET_STAGES.has(stage) || stage === "finishing") &&
+					(stage === "pending" || existing.activeType !== normalizeStage(stage))
 					? resetBatchFields(existing)
 					: existing;
 				const activeType = stage === "pending" ? null : normalizeStage(stage);
@@ -429,14 +481,14 @@ export function initDownloadQueueState(): void {
 			const { version } = payload.data as { version: string };
 			failedVersions.delete(version);
 			const item = downloads.get(version);
-			if (item) {
+			if (item && !item.error) {
 				downloads.set(version, {
 					...item,
 					done: true,
 					activeType: null,
 				});
+				removeDownload(version, 4000);
 			}
-			removeDownload(version, 4000);
 		}),
 	);
 
@@ -453,31 +505,14 @@ export function initDownloadQueueState(): void {
 				version: string;
 				message?: string;
 			};
-			failedVersions.add(version);
-			const item = downloads.get(version);
-			if (item) {
-				downloads.set(version, {
-					...item,
-					done: true,
-					activeType: null,
-					error: message ?? null,
-				});
-			} else {
-				downloads.set(version, {
-					version,
-					activeType: null,
-					segs: emptySegs(),
-					done: true,
-					error: message ?? null,
-				});
-			}
-			removeDownload(version, 8000);
+			markDownloadFailed(version, message ?? "");
 		}),
 	);
+	void syncWithBackend(true);
 }
 
 function onResync(): void {
-	void syncWithBackend();
+	void syncWithBackend(true);
 }
 
 export function destroyDownloadQueueState(): void {
@@ -547,25 +582,22 @@ export const pendingVersionDownloads = new SvelteSet<string>();
 export async function trackConnecting<T>(
 	version: string | null,
 	run: () => Promise<T>,
+	retry: (() => Promise<unknown>) | null = run,
 ): Promise<T> {
-	if (version && !downloads.has(version)) {
-		downloads.set(version, {
-			version,
-			activeType: null,
-			segs: emptySegs(),
-			done: false,
-			error: null,
-			cancellable: true,
-			connecting: true,
-		});
-	}
+	const existing = version ? downloads.get(version) : undefined;
+	const provisional = version && (!existing || existing.done)
+		? { ...pendingItem(version), retry: retry ?? undefined, cancellable: false, connecting: true }
+		: null;
+	if (version && provisional) downloads.set(version, provisional);
 	try {
 		return await run();
-	} finally {
-		if (version) {
-			const item = downloads.get(version);
-			if (item?.connecting) downloads.delete(version);
+	} catch (cause) {
+		if (version && !isCancelError(cause) && (downloads.get(version) === provisional || downloads.get(version)?.error)) {
+			markDownloadFailed(version, String(cause));
 		}
+		throw cause;
+	} finally {
+		if (version && downloads.get(version) === provisional) downloads.delete(version);
 	}
 }
 
@@ -575,7 +607,7 @@ export async function trackConnecting<T>(
  * quede trabajo —aunque sea post-proceso o la siguiente fase— se queda en 99.
  */
 export function getOverallPct(item: DownloadQueueItem): number {
-	if (item.done) return 100;
+	if (item.done && !item.error) return 100;
 	if (item.bytesTotal && item.bytesTotal > 0) {
 		return clampPct(item.bytesCurrent ?? 0, item.bytesTotal);
 	}

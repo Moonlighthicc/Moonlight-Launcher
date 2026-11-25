@@ -11,7 +11,7 @@
 		isCancelError,
 		openUrl,
 	} from "$lib/api/cubicApi";
-	import { trackConnecting } from "$lib/state/downloadQueueState.svelte";
+	import { clearModpackDownloadErrors, trackConnecting } from "$lib/state/downloadQueueState.svelte";
 	import { dismissModpackInstall, modpackInstalls, retryModpackInstall, runModpackInstall } from "$lib/state/modpackInstalls.svelte";
 	import type {
 		ModrinthProject,
@@ -315,6 +315,7 @@
 			const mrpackPath = await trackConnecting(
 				archive,
 				() => downloadMrpack(primaryFile.url, versionId),
+				null,
 			);
 			const result = await installMrpackWithUpstream(
 				mrpackPath,
@@ -339,11 +340,13 @@
 		if (!task || task.error === null || !selectedItem) return;
 		const { id } = selectedItem;
 		const { name } = task;
+		clearModpackDownloadErrors(task);
 		if (!(await retryModpackInstall(`modrinth:${id}`))) onInstallFailed?.(name);
 		else if (alive && selectedItem?.id === id) onInstalled?.();
 	}
 
 	function dismissInstall() {
+		if (task?.error) clearModpackDownloadErrors(task);
 		if (selectedItem) dismissModpackInstall(`modrinth:${selectedItem.id}`);
 	}
 

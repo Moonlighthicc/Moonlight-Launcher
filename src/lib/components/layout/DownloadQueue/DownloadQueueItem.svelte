@@ -14,6 +14,10 @@
 		bytesCurrent = 0,
 		bytesTotal = 0,
 		speedBytesPerSecond = 0,
+		speedHistory = [],
+		name,
+		onRetry,
+		onDismiss,
 		currentItem = null,
 		itemProgress,
 		cancellable = true,
@@ -28,6 +32,10 @@
 		bytesCurrent?: number;
 		bytesTotal?: number;
 		speedBytesPerSecond?: number;
+		speedHistory?: number[];
+		name?: string;
+		onRetry?: () => void;
+		onDismiss?: () => void;
 		currentItem?: string | null;
 		itemProgress?: { current: number; total: number };
 		cancellable?: boolean;
@@ -66,6 +74,7 @@
 	}
 
 	const downloadLabel = $derived.by(() => {
+		if (name) return name;
 		if (version.startsWith("modpack-")) {
 			return (
 				instanceName(version.slice("modpack-".length)) ??
@@ -87,9 +96,20 @@
 		}
 		return version;
 	});
+	const speedBars = $derived.by(() => {
+		const peak = Math.max(1, ...speedHistory);
+		return speedHistory.map((speed) => 24 * speed / peak);
+	});
 </script>
 
 <div class="sd-item" class:done class:error>
+	{#if !done && speedHistory.some((speed) => speed > 0)}
+		<svg class="sd-speed-graph" viewBox="0 0 96 24" preserveAspectRatio="none" aria-hidden="true">
+			{#each speedBars as height, index}
+				<rect x={(24 - speedBars.length + index) * 4} y={24 - height} width="3" {height} />
+			{/each}
+		</svg>
+	{/if}
 	<div class="sd-item-header">
 		<span class="sd-item-left">
 			{#if error}
@@ -111,7 +131,11 @@
 		{:else}
 			<span class="sd-pct" class:done>{overall}%</span>
 		{/if}
-		{#if !done && !error && !cancelling && cancellable && onCancel}
+		{#if error && onDismiss}
+			<button type="button" class="sd-cancel" aria-label={t("common.close")} onclick={onDismiss}>
+				<CloseIcon size={10} />
+			</button>
+		{:else if !done && !cancelling && cancellable && onCancel}
 			<button
 				type="button"
 				class="sd-cancel"
@@ -125,6 +149,9 @@
 	</div>
 	{#if error}
 		<div class="sd-error-msg">{error}</div>
+		{#if onRetry}
+			<button type="button" class="sd-retry" onclick={onRetry}>{t("common.retry")}</button>
+		{/if}
 	{:else}
 		<div class="sd-progress-track">
 			<div
@@ -133,14 +160,16 @@
 				style:width="{Math.min(100, Math.max(0, overall))}%"
 			></div>
 		</div>
-		{#if !done && (bytesTotal > 0 || currentItem || (itemProgress?.total ?? 0) > 0)}
+		{#if !done && (bytesCurrent > 0 || bytesTotal > 0 || speedHistory.length > 0 || currentItem || (itemProgress?.total ?? 0) > 0)}
 			<div class="sd-transfer-meta">
 				{#if bytesTotal > 0}
 					<span>{formatBytes(Math.min(Math.max(0, bytesCurrent), bytesTotal))} / {formatBytes(bytesTotal)}</span>
-					{#if speedBytesPerSecond > 0}<span>{formatSpeed(speedBytesPerSecond)}</span>{/if}
 				{:else if itemProgress && itemProgress.total > 0}
 					<span>{Math.min(itemProgress.current, itemProgress.total)} / {itemProgress.total}</span>
+				{:else if bytesCurrent > 0}
+					<span>{formatBytes(bytesCurrent)}</span>
 				{/if}
+				{#if speedHistory.length > 0}<span>{formatSpeed(speedBytesPerSecond)}</span>{/if}
 				{#if currentItem}
 					<span class="sd-current-file" title={currentItem}>
 						{currentItem}
@@ -153,12 +182,38 @@
 
 <style>
 	.sd-item {
+		position: relative;
+		isolation: isolate;
 		padding: 8px 10px;
 		border-bottom: 1px solid var(--border);
 		display: flex;
 		flex-direction: column;
 		gap: 6px;
 	}
+
+	.sd-speed-graph {
+		position: absolute;
+		inset: auto 0 0 auto;
+		width: 64%;
+		height: min(100%, 42px);
+		fill: var(--accent);
+		opacity: 0.15;
+		pointer-events: none;
+		z-index: -1;
+	}
+
+	.sd-retry {
+		align-self: flex-start;
+		padding: 3px 7px;
+		border: 1px solid var(--border);
+		border-radius: var(--border-radius-sm);
+		background: var(--surface-selected);
+		color: var(--text-primary);
+		font-size: 0.65rem;
+		cursor: pointer;
+	}
+
+	.sd-retry:hover { background: var(--surface-hover); }
 
 	.sd-item:last-child {
 		border-bottom: none;

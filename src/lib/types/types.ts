@@ -384,6 +384,7 @@ export type AppEvent =
 				item_total: number;
 				bytes_current: number;
 				bytes_total: number;
+				transferred_bytes: number;
 				current_item: string | null;
 			};
 	  }
@@ -413,6 +414,7 @@ export type AppEvent =
 			data: {
 				version: string;
 				cancellable?: boolean;
+				version_download?: boolean;
 			};
 	  }
 	| {

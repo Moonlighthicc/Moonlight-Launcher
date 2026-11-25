@@ -8,6 +8,42 @@ fn download_backoff_gives_the_connection_time_to_recover() {
     assert_eq!(download_retry_delay(2, 500), Duration::from_secs(120));
 }
 
+#[tokio::test]
+async fn interrupted_download_resumes_at_the_saved_offset() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for (expected_range, response) in [
+            (false, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\na"),
+            (true, "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 1-2/3\r\nConnection: close\r\n\r\nbc"),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert_eq!(request.contains("\r\nrange: bytes=1-\r\n"), expected_range);
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("artifact");
+    let reporter = crate::progress::ProgressState::new(1, 0);
+    let item = crate::progress::DownloadReporter::new(reporter.clone());
+    let result = download_single_url(
+        &format!("http://{address}/artifact"), &file,
+        "a9993e364706816aba3e25717850c26c9cd0d89d", Some(&item), &[], 2,
+    ).await;
+    server.await.unwrap();
+    result.unwrap();
+    assert_eq!(tokio::fs::read(&file).await.unwrap(), b"abc");
+    assert_eq!(reporter.snapshot().transferred_bytes, 3);
+}
+
 #[test]
 fn test_file_hasher_selects_algorithm_by_length() {
     // SHA-256 (64 caracteres) para los paquetes de JRE.

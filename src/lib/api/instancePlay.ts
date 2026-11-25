@@ -16,7 +16,11 @@ export async function playInstance(instance: InstanceDto, needsDownload?: boolea
 		const missing = needsDownload ?? (integrity ? !integrity.complete : hasDownloadFailed(instance.version));
 		if (isInstanceDownloading(instance)) return;
 		if (missing) {
-			await trackConnecting(instance.version, () => addToQueue(instance.version));
+			try {
+				await trackConnecting(instance.version, () => addToQueue(instance.version));
+			} catch {
+				// The queue retains the retry action.
+			}
 			return;
 		}
 	}
