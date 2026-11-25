@@ -168,7 +168,8 @@
                         showErrorParsed(error);
                 }
         }
-        const resizeDuration = $derived(animDuration(220));
+        // Fit the download label immediately instead of clipping it during a width animation.
+        const resizeDuration = $derived(buttonDownloading ? 0 : animDuration(220));
 
         const statusLabel = $derived(
                 instance.status === "started"
@@ -872,10 +873,6 @@
                 display: flex;
         }
 
-        .downloading .launch-label {
-                padding-inline-end: 4ch;
-        }
-
         .download-border {
                 position: absolute;
                 inset: 0;
@@ -892,9 +889,7 @@
         }
 
         .download-percent {
-                position: absolute;
-                inset-inline-end: 0;
-                inline-size: 4ch;
+                flex: 0 0 4.5ch;
                 text-align: start;
                 font-variant-numeric: tabular-nums;
                 color: var(--accent);
