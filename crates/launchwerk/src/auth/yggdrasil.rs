@@ -307,7 +307,14 @@ impl YggdrasilAuth {
             .timeout(VALIDATE_TIMEOUT)
             .send()
             .await
-            .map_err(|_| "Validate request failed".to_string())?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "Yggdrasil /validate timed out".to_string()
+                } else {
+                    // Strip the URL so a user-supplied query or credentials never reach logs.
+                    format!("Yggdrasil /validate request failed: {}", e.without_url())
+                }
+            })?;
 
         let status = response.status();
         if status.is_success() {

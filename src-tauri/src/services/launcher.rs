@@ -633,8 +633,17 @@ impl Launcher {
         // Auto-refresh del token Microsoft — el lock de settings se toma y suelta rápido
         user = refresh_microsoft_token(user, false).await?;
 
-        // Auto-refresh del token Yggdrasil
-        user = refresh_yggdrasil_token(user).await?;
+        // Cache the agent independently of the auth server: an unavailable
+        // /validate endpoint must not prevent the JAR from being installed.
+        let authlib_injector = if user.user_type == AccountType::Yggdrasil {
+            let jar_path = yggdrasil::download_authlib_injector(&shared_dir)
+                .await
+                .map_err(|e| DownloadError::Request(format!("authlib-injector: {e}")))?;
+            user = refresh_yggdrasil_token(user).await?;
+            Some(jar_path)
+        } else {
+            None
+        };
         set_user_filter(&user);
 
         // let min_mem = format!("{}G", settings_m.min_memory);
@@ -683,9 +692,9 @@ impl Launcher {
                     AuthError::SessionExpired("Missing Yggdrasil server address".into())
                 })?;
                 // This session must use the same API root for validation and in the JVM.
-                let jar_path = yggdrasil::download_authlib_injector(&shared_dir)
-                    .await
-                    .map_err(|e| DownloadError::Request(format!("authlib-injector: {e}")))?;
+                let jar_path = authlib_injector.ok_or_else(|| {
+                    crate::core::CoreError::Other("Missing prepared authlib-injector JAR".into())
+                })?;
                 extra_jvm_args.push(format!("-javaagent:{}={}", jar_path.display(), api_root));
                 builder = builder.authlib_injector_path(jar_path);
                 if let Ok(metadata_b64) = yggdrasil::fetch_metadata_prefetch(api_root).await {
@@ -1115,8 +1124,8 @@ async fn refresh_yggdrasil_token(mut user: MinecraftUser) -> Result<MinecraftUse
         Ok(false) => {
             info!("Yggdrasil server rejected the token, trying to refresh...");
         }
-        Err(_) => {
-            return Err(DownloadError::Request("Yggdrasil session validation".into()).into());
+        Err(e) => {
+            return Err(DownloadError::Request(format!("Yggdrasil session validation: {e}")).into());
         }
     }
 
