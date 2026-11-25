@@ -1,0 +1,105 @@
+.qm-root {
+	height: 100%;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg-main);
+	color: var(--text-primary);
+	font-family: var(--font-family);
+}
+
+.confirmation-message {
+	font-size: var(--confirmation-font-size, 0.9rem);
+	color: var(--text-secondary);
+	line-height: var(--confirmation-line-height, 1.4);
+}
+
+.qm-header {
+	padding: var(--modal-header-padding, 20px 20px 10px);
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	background: var(--bg-sidebar);
+}
+
+.qm-label {
+	font-size: 1.1rem;
+	font-weight: 600;
+	color: var(--text-primary);
+}
+
+.qm-close-btn {
+	background: none;
+	border: none;
+	color: var(--text-muted);
+	cursor: pointer;
+	font-size: 1.2rem;
+	transition: color 0.2s;
+}
+
+.qm-close-btn:hover {
+	color: var(--text-primary);
+}
+
+.qm-tabs {
+	display: flex;
+	padding: 0 10px;
+	background: var(--bg-sidebar);
+	border-bottom: var(--border-width) solid var(--border-color);
+	gap: var(--space-xs);
+}
+
+.qm-tab-btn {
+	flex: 1;
+	background: none;
+	border: none;
+	color: var(--text-muted);
+	padding: var(--tab-padding, 8px 4px);
+	cursor: pointer;
+	font-size: var(--font-size-sm);
+	font-weight: var(--font-weight-medium);
+	border-bottom: 2px solid transparent;
+	transition: all 0.2s;
+}
+
+.qm-tab-btn.active {
+	color: var(--text-primary);
+	border-bottom-color: var(--accent);
+}
+
+.qm-scroll {
+	flex: 1;
+	overflow-y: auto;
+}
+
+.qm-scroll::-webkit-scrollbar {
+	width: var(--scrollbar-size);
+}
+
+.qm-scroll::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+.qm-scroll::-webkit-scrollbar-thumb {
+	background: var(--scrollbar-thumb);
+	border-radius: var(--scrollbar-radius);
+}
+
+.qm-empty-state {
+	color: var(--text-muted);
+	font-size: var(--font-size-control);
+	padding: 10px 0;
+}
+
+.qm-footer {
+	padding: var(--modal-footer-padding, 15px 20px);
+	background: var(--bg-main);
+	border-top: var(--border-width) solid var(--border-color);
+	display: flex;
+	justify-content: center;
+}
+
+.qm-version {
+	font-size: 0.7rem;
+	color: var(--text-muted);
+	font-weight: 500;
+}

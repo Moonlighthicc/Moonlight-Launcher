@@ -1,0 +1,203 @@
+use super::*;
+use std::fs;
+use std::sync::atomic::Ordering;
+
+fn fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("saves")).unwrap();
+    fs::write(source.path().join("saves/world.dat"), b"world").unwrap();
+    fs::write(source.path().join("options.txt"), b"opts").unwrap();
+    (source, target)
+}
+
+#[test]
+fn transfer_reports_hardlink_for_a_fresh_destination() {
+    let (source, target) = fixture();
+    let (strategy, failures) = move_tree(
+        source.path(),
+        target.path(),
+        &AtomicBool::new(false),
+        |_, _, _, _| {},
+    )
+    .unwrap();
+    assert_eq!(strategy, "hardlink");
+    assert!(failures.is_empty());
+    assert_eq!(
+        fs::read(target.path().join("saves/world.dat")).unwrap(),
+        b"world"
+    );
+    assert_eq!(
+        fs::read(target.path().join("options.txt")).unwrap(),
+        b"opts"
+    );
+}
+
+#[test]
+fn destination_that_already_exists_falls_back_to_copy_and_overwrites() {
+    let (source, target) = fixture();
+    // Un destino preexistente impide el hardlink y ejercita el fallback a copia.
+    fs::create_dir_all(target.path().join("saves")).unwrap();
+    fs::write(target.path().join("saves/world.dat"), b"stale").unwrap();
+    let (strategy, failures) = move_tree(
+        source.path(),
+        target.path(),
+        &AtomicBool::new(false),
+        |_, _, _, _| {},
+    )
+    .unwrap();
+    assert_eq!(strategy, "copy");
+    assert!(failures.is_empty());
+    assert_eq!(
+        fs::read(target.path().join("saves/world.dat")).unwrap(),
+        b"world"
+    );
+    // El original nunca se toca durante el traslado.
+    assert_eq!(
+        fs::read(source.path().join("saves/world.dat")).unwrap(),
+        b"world"
+    );
+}
+
+#[test]
+fn cancellation_leaves_the_destination_empty_and_the_source_intact() {
+    let (source, target) = fixture();
+    let cancelled = AtomicBool::new(true);
+    let result = move_tree(source.path(), target.path(), &cancelled, |_, _, _, _| {});
+    assert!(result.is_err());
+    assert!(fs::read_dir(target.path()).unwrap().next().is_none());
+    assert!(source.path().join("saves/world.dat").is_file());
+    assert!(cancelled.load(Ordering::Relaxed));
+}
+
+#[test]
+fn a_wide_tree_is_transferred_by_several_workers_without_losing_files() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let mut expected = Vec::new();
+    for dir in 0..4 {
+        let sub = source.path().join(format!("dir{dir}"));
+        fs::create_dir_all(&sub).unwrap();
+        for file in 0..8 {
+            let name = format!("file{file}.dat");
+            let content = format!("{dir}-{file}");
+            fs::write(sub.join(&name), &content).unwrap();
+            expected.push((format!("dir{dir}/{name}"), content));
+        }
+    }
+    let mut total = 0u64;
+    let mut reported = (0u64, 0u64);
+    let (strategy, failures) = move_tree(
+        source.path(),
+        target.path(),
+        &AtomicBool::new(false),
+        |current, t, _, _| {
+            if t > 0 {
+                total = t;
+                reported = (current, t);
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(strategy, "hardlink");
+    assert!(failures.is_empty());
+    assert_eq!(reported, (total, total));
+    for (relative, content) in &expected {
+        assert_eq!(
+            fs::read_to_string(target.path().join(relative)).unwrap(),
+            *content
+        );
+        // El original sigue intacto hasta que el llamador confirma el traslado.
+        assert_eq!(
+            fs::read_to_string(source.path().join(relative)).unwrap(),
+            *content
+        );
+    }
+}
+
+#[test]
+fn remove_tree_deletes_the_whole_original_directory() {
+    let (source, _target) = fixture();
+    remove_tree(source.path());
+    assert!(!source.path().exists());
+}
+
+#[test]
+fn the_pending_deletions_folder_does_not_block_a_destination() {
+    let target = tempfile::tempdir().unwrap();
+    assert!(is_empty_dir(target.path()));
+
+    // La carpeta interna de borrados diferidos (aunque tenga contenido)
+    // cuenta como vacía: sus nombres nunca chocan con instancias.
+    let deletions = target
+        .path()
+        .join(crate::services::instance_manager::DELETION_DIR);
+    fs::create_dir_all(deletions.join("stale-instance")).unwrap();
+    assert!(is_empty_dir(target.path()));
+
+    // Una carpeta de instancia real sí bloquea el traslado.
+    fs::create_dir(target.path().join("My Instance")).unwrap();
+    assert!(!is_empty_dir(target.path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlinks_share_one_copy_and_survive_removing_the_original() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (source, target) = fixture();
+    let mut reported = (0u64, 0u64);
+    let (strategy, failures) = move_tree(
+        source.path(),
+        target.path(),
+        &AtomicBool::new(false),
+        |current, total, _, _| reported = (current, total),
+    )
+    .unwrap();
+    assert_eq!(strategy, "hardlink");
+    assert!(failures.is_empty());
+    assert_eq!(reported, (9, 9)); // "world" (5) + "opts" (4)
+
+    // Hardlink: mismo inodo y dos enlaces al mismo contenido.
+    let src_meta = fs::metadata(source.path().join("saves/world.dat")).unwrap();
+    let dst_meta = fs::metadata(target.path().join("saves/world.dat")).unwrap();
+    assert_eq!(src_meta.ino(), dst_meta.ino());
+    assert_eq!(src_meta.nlink(), 2);
+
+    // Borrar el original no pierde datos: el enlace destino mantiene el contenido.
+    remove_tree(source.path());
+    assert!(!source.path().exists());
+    assert_eq!(
+        fs::read(target.path().join("saves/world.dat")).unwrap(),
+        b"world"
+    );
+    assert_eq!(
+        fs::read(target.path().join("options.txt")).unwrap(),
+        b"opts"
+    );
+    assert_eq!(
+        fs::metadata(target.path().join("saves/world.dat"))
+            .unwrap()
+            .nlink(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_directories_are_reported_without_files() {
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("empty")).unwrap();
+    let mut entries = Vec::new();
+    let mut total = 0;
+    collect_files(
+        source.path(),
+        source.path(),
+        &mut entries,
+        &mut total,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(entries.is_empty());
+    assert_eq!(total, 0);
+}

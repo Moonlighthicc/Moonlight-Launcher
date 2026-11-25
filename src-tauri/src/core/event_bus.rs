@@ -1,0 +1,95 @@
+use crate::services::InstanceDto;
+use compact_str::CompactString;
+use serde::Serialize;
+use std::borrow::Cow;
+use std::sync::{Arc, OnceLock};
+use tauri::{AppHandle, Emitter};
+
+static APP: OnceLock<AppHandle> = OnceLock::new();
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", content = "data")]
+pub enum AppEvent {
+    /// Окно Minecraft готово (маркер загрузки клиента), можно погасить индикатор запуска.
+    InstanceGameReady {
+        id: CompactString,
+    },
+    /// Current Minecraft process IDs for an instance changed.
+    InstanceProcessesChanged {
+        id: CompactString,
+        process_ids: Vec<String>,
+    },
+    InstanceEdited {
+        id: CompactString,
+        dto: Option<InstanceDto>,
+    },
+    InstanceCreated {
+        id: CompactString,
+        dto: InstanceDto,
+    },
+    InstanceDeleted {
+        id: CompactString,
+    },
+    DProgress {
+        version: Arc<str>,
+        stage: Cow<'static, str>,
+        item_current: u64,
+        item_total: u64,
+        bytes_current: u64,
+        bytes_total: u64,
+        current_item: Option<String>,
+    },
+    DStage {
+        version: Arc<str>,
+        stage: Cow<'static, str>,
+        info: Option<String>,
+    },
+    DEnqueue {
+        version: Arc<str>,
+        /// false para tareas que no admiten cancelación (modpacks, lotes de JRE).
+        cancellable: bool,
+    },
+    DFinish {
+        version: Arc<str>,
+    },
+    /// La descarga fue cancelada por el usuario; la UI debe retirarla sin error.
+    DCancel {
+        version: Arc<str>,
+    },
+    DError {
+        version: Arc<str>,
+        message: CompactString,
+    },
+    JREChanged,
+    STChanged,
+    ThemeChanged {
+        id: CompactString,
+    },
+    ModsEnriched {
+        id: CompactString,
+    },
+    ResourcepacksEnriched {
+        id: CompactString,
+    },
+    ShaderpacksEnriched {
+        id: CompactString,
+    },
+    InstanceCrashed {
+        id: CompactString,
+        name: CompactString,
+        exit_code: Option<i32>,
+        reason: Option<CompactString>,
+    },
+}
+
+pub fn init(app: AppHandle) {
+    let _ = APP.set(app);
+}
+
+pub fn emit(event: AppEvent) {
+    if let Some(app) = APP.get()
+        && let Err(err) = app.emit("app-event", event)
+    {
+        tracing::warn!("failed to emit event: {}", err);
+    }
+}

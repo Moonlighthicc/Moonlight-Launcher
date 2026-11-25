@@ -1,0 +1,12 @@
+[package]
+name = "ablage"
+version = "0.1.0"
+edition = "2024"
+description = "Content-addressable storage library for moonlauncher"
+authors = ["Santiagolxx", "moonlauncher contributors"]
+license = "GPL-3.0-only"
+
+[dependencies]
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+crc32fast = "1"

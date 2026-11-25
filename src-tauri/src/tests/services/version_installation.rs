@@ -1,0 +1,158 @@
+use super::*;
+
+fn profile(shared: &Path, version: &str, extra: serde_json::Value) {
+    let dir = version_dir(shared, version);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut json = serde_json::json!({"id": version, "mainClass": "Main"});
+    json.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    std::fs::write(
+        dir.join(format!("{version}.json")),
+        serde_json::to_vec(&json).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn metadata_and_failed_retries_are_not_completed_installations() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path();
+    profile(shared, "1.21", serde_json::json!({}));
+    assert!(!is_complete(shared, "1.21"));
+    std::fs::write(version_dir(shared, "1.21").join("1.21.jar"), b"client").unwrap();
+    assert!(is_complete(shared, "1.21"), "legacy offline installation");
+    begin(shared, "1.21").await.unwrap();
+    assert!(!is_complete(shared, "1.21"), "interrupted installation");
+    finish(shared, "1.21").await.unwrap();
+    assert!(is_complete(shared, "1.21"));
+    begin(shared, "1.21").await.unwrap();
+    assert!(
+        !is_complete(shared, "1.21"),
+        "old receipt must not hide a failed repair"
+    );
+    finish(shared, "1.21").await.unwrap();
+    assert!(is_complete(shared, "1.21"));
+}
+
+#[tokio::test]
+async fn a_completed_loader_still_requires_its_base_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path();
+    let loader = "fabric-loader-0.17.0-1.21";
+    profile(shared, loader, serde_json::json!({"inheritsFrom": "1.21"}));
+    begin(shared, loader).await.unwrap();
+    finish(shared, loader).await.unwrap();
+    assert!(is_complete(shared, loader));
+    assert_eq!(missing_dependencies(shared, loader), vec!["1.21"]);
+    profile(shared, "1.21", serde_json::json!({}));
+    std::fs::write(version_dir(shared, "1.21").join("1.21.jar"), b"client").unwrap();
+    assert!(missing_dependencies(shared, loader).is_empty());
+}
+
+#[test]
+fn legacy_profiles_require_runtime_libraries_and_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path();
+    profile(
+        shared,
+        "1.21",
+        serde_json::json!({
+            "libraries": [{"name": "test:lib:1", "downloads": {"artifact": {"path": "test.jar", "size": 3}}}],
+            "assetIndex": {"id": "test"}
+        }),
+    );
+    std::fs::write(version_dir(shared, "1.21").join("1.21.jar"), b"client").unwrap();
+    assert!(!is_complete(shared, "1.21"));
+    std::fs::create_dir_all(shared.join("libraries")).unwrap();
+    std::fs::write(shared.join("libraries/test.jar"), b"jar").unwrap();
+    assert!(!is_complete(shared, "1.21"));
+    std::fs::create_dir_all(shared.join("assets/indexes")).unwrap();
+    std::fs::write(
+        shared.join("assets/indexes/test.json"),
+        br#"{"objects":{}}"#,
+    )
+    .unwrap();
+    assert!(is_complete(shared, "1.21"));
+    std::fs::write(shared.join("libraries/test.jar"), b"x").unwrap();
+    assert!(!is_complete(shared, "1.21"));
+}
+
+#[test]
+fn installed_versions_cache_refreshes_when_the_directory_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path();
+    profile(shared, "1.21", serde_json::json!({}));
+    std::fs::write(version_dir(shared, "1.21").join("1.21.jar"), b"client").unwrap();
+    assert_eq!(installed_versions(shared), vec!["1.21"]);
+
+    // A new incomplete version changes the directory signature but is filtered.
+    profile(shared, "1.22", serde_json::json!({}));
+    assert_eq!(installed_versions(shared), vec!["1.21"]);
+
+    // Completing it without an explicit invalidation also invalidates via mtime.
+    std::fs::write(version_dir(shared, "1.22").join("1.22.jar"), b"client").unwrap();
+    assert_eq!(installed_versions(shared), vec!["1.22", "1.21"]);
+
+    std::fs::remove_dir_all(version_dir(shared, "1.21")).unwrap();
+    assert_eq!(installed_versions(shared), vec!["1.22"]);
+}
+
+#[tokio::test]
+async fn install_begin_and_finish_invalidate_the_installed_versions_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path();
+    profile(shared, "1.21", serde_json::json!({}));
+    std::fs::write(version_dir(shared, "1.21").join("1.21.jar"), b"client").unwrap();
+    assert_eq!(installed_versions(shared), vec!["1.21"]);
+
+    begin(shared, "1.22").await.unwrap();
+    profile(shared, "1.22", serde_json::json!({}));
+    std::fs::write(version_dir(shared, "1.22").join("1.22.jar"), b"client").unwrap();
+    assert_eq!(
+        installed_versions(shared),
+        vec!["1.21"],
+        "an interrupted install is not offered"
+    );
+
+    finish(shared, "1.22").await.unwrap();
+    assert_eq!(installed_versions(shared), vec!["1.22", "1.21"]);
+}
+
+#[tokio::test]
+async fn traversal_versions_never_create_or_remove_receipts() {
+    let temp = tempfile::tempdir().unwrap();
+    let shared = temp.path().join("shared");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join(PENDING), b"sentinel").unwrap();
+    for version in [
+        "../../test.txt",
+        "../outside/file.txt",
+        "foo/../../outside/file.txt",
+        "../../outside",
+        "/outside",
+        "C:\\outside",
+        "1.21-forge-x/../../../outside",
+    ] {
+        assert!(begin(&shared, version).await.is_err());
+        assert!(finish(&shared, version).await.is_err());
+        assert!(!is_complete(&shared, version));
+    }
+    assert!(!shared.exists());
+    assert_eq!(std::fs::read(outside.join(PENDING)).unwrap(), b"sentinel");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn receipts_do_not_follow_symlinked_version_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let shared = temp.path().join("shared");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(shared.join("versions")).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, shared.join("versions/1.21")).unwrap();
+    assert!(begin(&shared, "1.21").await.is_err());
+    assert!(finish(&shared, "1.21").await.is_err());
+    assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+}

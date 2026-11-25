@@ -1,0 +1,249 @@
+//! Provider para importar instancias exportadas por moonlauncher.
+//!
+//! Detecta el archivo `cubic-manifest.json` generado por el exportador propio y
+//! reconstruye la instancia conservando loader, versión, memoria, Java e icono.
+
+use super::super::{ImportError, InstanceImportPlan, InstanceImporter};
+use super::multimc::migrate::{migrate_game_data, resolve_game_dir};
+use crate::core::{AppEvent, emit};
+use crate::services::instance_import::sanitize_instance_name;
+use crate::services::instance_manager::data::RamOverrides;
+use crate::services::modpack::{self, PackState};
+use crate::services::{DownloadQueue, InstOverrides, InstanceDto, InstanceManager};
+use serde::Deserialize;
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use tracing::{info, warn};
+
+/// Manifiesto escrito por `services::instance_export`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CubicManifest {
+    pub format_version: u8,
+    #[allow(dead_code)]
+    pub exported_by: String,
+    #[allow(dead_code)]
+    pub uuid: String,
+    pub name: String,
+    pub version_id: String,
+    pub mc_version: String,
+    pub loader: String,
+    pub loader_version: Option<String>,
+    pub min_memory: u32,
+    pub max_memory: u32,
+    pub overrides: Option<InstOverrides>,
+    #[serde(default)]
+    pub minecraft_jar: crate::services::minecraft_jar::MinecraftJarConfig,
+    #[serde(default)]
+    pub modpack: Option<PackState>,
+}
+
+/// Provider para ZIPs exportados por moonlauncher.
+pub struct CubicProvider;
+
+impl InstanceImporter for CubicProvider {
+    fn id(&self) -> &'static str {
+        "cubic"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "moonlauncher"
+    }
+
+    fn detect(&self, preview_dir: &Path) -> bool {
+        preview_dir.join("cubic-manifest.json").is_file()
+    }
+
+    fn preview(&self, preview_dir: &Path) -> Result<InstanceImportPlan, ImportError> {
+        let manifest = read_manifest(preview_dir)?;
+        let sanitized = sanitize_instance_name(&manifest.name);
+
+        Ok(InstanceImportPlan {
+            format_id: self.id(),
+            format_name: self.display_name(),
+            original_name: manifest.name,
+            sanitized_name: sanitized,
+            minecraft_version: Some(manifest.mc_version),
+            loader: Some(manifest.loader),
+            loader_version: manifest.loader_version,
+            warnings: Vec::new(),
+            preview_token: String::new(),
+        })
+    }
+
+    fn import<'a>(
+        &'a self,
+        preview_dir: &'a Path,
+        target_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<InstanceDto, ImportError>> + Send + 'a>> {
+        Box::pin(import_cubic_instance(preview_dir, target_name))
+    }
+}
+
+fn read_manifest(preview_dir: &Path) -> Result<CubicManifest, ImportError> {
+    let path = preview_dir.join("cubic-manifest.json");
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        ImportError::InvalidArchive(format!("Could not read cubic-manifest.json: {e}"))
+    })?;
+
+    let manifest: CubicManifest = serde_json::from_str(&content)
+        .map_err(|e| ImportError::InvalidArchive(format!("Invalid cubic-manifest.json: {e}")))?;
+    manifest
+        .minecraft_jar
+        .validate()
+        .map_err(ImportError::InvalidArchive)?;
+
+    if let Some(state) = &manifest.modpack {
+        if state.schema_version != 1 {
+            return Err(ImportError::InvalidArchive(
+                "Unsupported modpack registry version".into(),
+            ));
+        }
+        for relative in state.files.keys() {
+            modpack::valid_path(relative).map_err(ImportError::InvalidArchive)?;
+        }
+    }
+
+    if manifest.format_version != 1 {
+        warn!(
+            "cubic-manifest.json with format_version {} (expected 1)",
+            manifest.format_version
+        );
+    }
+
+    Ok(manifest)
+}
+
+fn restore_modpack(source: &Path, target: &Path, state: &PackState) -> Result<(), String> {
+    for relative in state.files.keys() {
+        let src = modpack::checked_path(source, relative)?;
+        if !src.is_file() {
+            continue;
+        }
+        let dst = modpack::checked_path(target, relative)?;
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
+    }
+    // Los hashes describen el pack original; el backup puede estar personalizado.
+    modpack::save(target, state)
+}
+
+async fn import_cubic_instance(
+    preview_dir: &Path,
+    target_name: &str,
+) -> Result<InstanceDto, ImportError> {
+    let manifest = read_manifest(preview_dir)?;
+    let final_name = if target_name.trim().is_empty() {
+        sanitize_instance_name(&manifest.name)
+    } else {
+        target_name.to_string()
+    };
+
+    info!(
+        "Importing moonlauncher instance from {:?} as '{}'",
+        preview_dir, final_name
+    );
+
+    let handle = InstanceManager::get()
+        .create_instance(final_name, manifest.version_id.clone(), None)
+        .await
+        .map_err(|e| match e {
+            crate::core::errors::instance::InstanceError::AlreadyExists => {
+                ImportError::ProviderError {
+                    provider: "moonlauncher".into(),
+                    message: "An instance with that name already exists".into(),
+                }
+            }
+            other => ImportError::Instance(other),
+        })?;
+
+    let files_guard = handle
+        .try_lock_files()
+        .map_err(|message| ImportError::ProviderError {
+            provider: "moonlauncher".into(),
+            message,
+        })?;
+    let instance_dir = handle.get_instance_dir().await;
+    let source_game_dir = resolve_game_dir(preview_dir);
+
+    if source_game_dir.exists() {
+        migrate_game_data(&source_game_dir, &instance_dir).await?;
+    }
+
+    let jar_config = manifest.minecraft_jar.clone();
+    let jar_target = instance_dir.clone();
+    let modpack = manifest.modpack;
+    let (files_guard, copied) = tokio::task::spawn_blocking(move || {
+        let result =
+            crate::services::minecraft_jar::copy_inputs(&source_game_dir, &jar_target, &jar_config)
+                .and_then(|()| {
+                    if let Some(state) = &modpack {
+                        restore_modpack(&source_game_dir, &jar_target, state)?;
+                    }
+                    Ok(())
+                });
+        (files_guard, result)
+    })
+    .await
+    .map_err(|e| ImportError::InvalidArchive(e.to_string()))?;
+    copied.map_err(ImportError::InvalidArchive)?;
+    handle
+        .save_minecraft_jar(manifest.minecraft_jar)
+        .await
+        .map_err(ImportError::InvalidArchive)?;
+
+    let icon_src = preview_dir.join("icon.png");
+    if icon_src.is_file() {
+        let dest_icon = instance_dir.join("icon.png");
+        if let Err(e) = tokio::fs::copy(&icon_src, &dest_icon).await {
+            warn!("Could not copy the icon {:?}: {}", icon_src, e);
+        } else {
+            handle
+                .set_icon(Some(dest_icon.to_string_lossy().to_string()))
+                .await;
+        }
+    }
+
+    let java_version = manifest.overrides.as_ref().and_then(|o| o.java_version);
+    let jvm_args = manifest.overrides.as_ref().and_then(|o| o.jvm_args.clone());
+    let memory = Some(RamOverrides {
+        min_mem: manifest.min_memory,
+        max_mem: manifest.max_memory,
+    });
+    handle
+        .set_overrides(Some(InstOverrides {
+            java_version,
+            memory,
+            jvm_args,
+        }))
+        .await;
+
+    files_guard
+        .save_if_dirty()
+        .await
+        .map_err(|e| ImportError::ProviderError {
+            provider: "moonlauncher".into(),
+            message: format!("Failed to save the imported instance: {e}"),
+        })?;
+
+    DownloadQueue::get()
+        .enqueue(manifest.version_id.clone())
+        .await;
+
+    emit(AppEvent::InstanceCreated {
+        id: handle.uuid.to_string().into(),
+        dto: handle.to_dto().await,
+    });
+
+    info!(
+        "moonlauncher instance imported successfully: uuid={}",
+        handle.uuid
+    );
+    Ok(handle.to_dto().await)
+}
+
+#[cfg(test)]
+#[path = "../../../tests/services/instance_import/launchers/cubic.rs"]
+mod tests;

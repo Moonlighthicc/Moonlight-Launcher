@@ -1,0 +1,522 @@
+<script lang="ts">
+	import { t } from "$lib/i18n";
+	import type { MarketProject } from "$lib/types/market";
+	import Loading from "$lib/icons/Loading.svelte";
+	import Icon from "$lib/icons/Icon.svelte";
+	import MoonlightLogo from "./MoonlightLogo.svelte";
+	import { marketIconSrc } from "$lib/utils/marketIcons";
+
+	interface Props {
+		project: MarketProject;
+		list?: boolean;
+		selected?: boolean;
+		incompatible?: boolean;
+		installing?: boolean;
+		installDisabled?: boolean;
+		installError?: string | null;
+		onSelect: () => void;
+		onInstall?: () => void | Promise<void>;
+	}
+
+	let {
+		project,
+		list = false,
+		selected = false,
+		incompatible = false,
+		installing = false,
+		installDisabled = false,
+		installError = null,
+		onSelect,
+		onInstall,
+	}: Props = $props();
+
+	let pending = $state(false);
+	const busy = $derived(installing || pending);
+	let iconError = $state(false);
+	const iconSrc = $derived(marketIconSrc(project.icon));
+
+	function formatNumber(num: number): string {
+		if (num >= 1_000_000) return (num / 1_000_000).toFixed(1) + "M";
+		if (num >= 1_000) return (num / 1_000).toFixed(1) + "K";
+		return num.toString();
+	}
+
+	const canInstall = $derived(!project.installed && !!onInstall);
+
+	async function runInstall() {
+		if (project.installed || !onInstall || busy || installDisabled) return;
+		pending = true;
+		try {
+			await onInstall();
+		} finally {
+			pending = false;
+		}
+	}
+
+	async function handleInstall(e: Event) {
+		e.stopPropagation();
+		await runInstall();
+	}
+
+	function handleOpen(e: MouseEvent) {
+		// A double click installs; skip the second click so the detail panel
+		// only opens once.
+		if (e.detail > 1) return;
+		onSelect();
+	}
+
+	function handleCardDoubleClick() {
+		void runInstall();
+	}
+
+	const statusLabel = $derived.by(() => {
+		if (project.hasUpdate) return t("market.item.updateAvailable");
+		return null;
+	});
+
+	const sourceLabel = $derived.by(() => {
+		switch (project.source) {
+			case "modrinth":
+				return "Modrinth";
+			case "curseforge":
+				return "CurseForge";
+			case "local":
+				return t("market.item.local");
+			default:
+				return null;
+		}
+	});
+</script>
+
+<div
+	class="market-item"
+	class:list
+	class:selected
+	class:disabled={project.disabled}
+	class:incompatible
+>
+	<button
+		type="button"
+		class="market-item-open"
+		onclick={handleOpen}
+		ondblclick={handleCardDoubleClick}
+		title={canInstall ? t("market.item.doubleClickInstall") : undefined}
+		aria-label={project.title}
+	>
+		<span class="market-item-icon">
+			{#if iconSrc && !iconError}
+				<img
+					src={iconSrc}
+					alt=""
+					loading="lazy"
+					decoding="async"
+					onerror={() => (iconError = true)}
+				/>
+			{:else}
+				<MoonlightLogo />
+			{/if}
+		</span>
+
+		<span class="market-item-body">
+			<span class="market-item-header">
+				<span class="market-item-title" title={project.title}>
+					{project.title}
+				</span>
+				{#if statusLabel || incompatible}
+					<span class="market-item-badges">
+						{#if statusLabel}
+							<span class="market-item-badge update">
+								{statusLabel}
+							</span>
+						{/if}
+						{#if incompatible}
+							<span class="market-item-badge incompatible">
+								{t("market.item.incompatible")}
+							</span>
+						{/if}
+					</span>
+				{/if}
+			</span>
+
+			<span class="market-item-author">
+				{t("market.item.by")}
+				{project.author || t("market.item.unknownAuthor")}
+			</span>
+		</span>
+		<span
+			class="market-item-description"
+			class:install-error={!!installError}
+			role={installError ? "alert" : undefined}
+			title={installError ?? project.description}
+		>
+			{installError ||
+				project.description ||
+				t("market.item.noDescription")}
+		</span>
+	</button>
+
+	<div class="market-item-actions">
+		<div class="market-item-meta">
+			{#if sourceLabel}
+				<span class="market-item-source">{sourceLabel}</span>
+			{/if}
+			{#if project.downloadCount > 0}
+				<span
+					class="market-item-downloads"
+					title={`${t("market.detail.downloads")}: ${project.downloadCount.toLocaleString()}`}
+				>
+					<Icon name="ui:download" size={12} />{formatNumber(
+						project.downloadCount,
+					)}
+				</span>
+			{/if}
+		</div>
+
+		{#if project.installed}
+			<span class="market-item-installed-badge"
+				><Icon name="ui:check" size={12} />{t(
+					"market.item.installed",
+				)}</span
+			>
+		{:else if onInstall}
+			<button
+				type="button"
+				class="market-item-install-btn"
+				disabled={busy || installDisabled}
+				aria-label={`${t(busy ? "market.quickInstall.installing" : installError ? "market.quickInstall.retry" : "market.item.install")} ${project.title}`}
+				aria-busy={busy}
+				onclick={handleInstall}
+			>
+				{#if busy}
+					<Loading size={14} />
+					{t("market.quickInstall.installing")}
+				{:else}
+					{t(
+						installError
+							? "market.quickInstall.retry"
+							: "market.item.install",
+					)}
+				{/if}
+			</button>
+		{/if}
+	</div>
+</div>
+
+<style>
+	.market-item {
+		display: flex;
+		flex-direction: column;
+		align-items: stretch;
+		gap: var(--market-item-gap);
+		padding: var(--market-card-padding);
+		background: var(--surface-card);
+		border: var(--border-width) solid var(--border);
+		border-radius: var(--market-card-radius);
+		transition:
+			border-color var(--transition-fast) ease,
+			background-color var(--transition-fast) ease;
+		height: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+	}
+
+	.market-item:hover,
+	.market-item:focus-within {
+		background: var(--surface-hover);
+		border-color: var(--border-hover);
+	}
+
+	.market-item-open {
+		display: grid;
+		grid-template-columns: var(--market-icon-size) minmax(0, 1fr);
+		grid-template-rows: auto minmax(0, 1fr);
+		align-items: start;
+		gap: var(--market-item-gap);
+		flex: 1;
+		min-height: 0;
+		min-width: 0;
+		padding: 0;
+		border: none;
+		background: transparent;
+		color: inherit;
+		font: inherit;
+		text-align: start;
+		cursor: pointer;
+		border-radius: var(--border-radius-sm);
+	}
+
+	.market-item-open:focus-visible,
+	.market-item-install-btn:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 4px;
+	}
+
+	.market-item.selected {
+		border-color: var(--accent);
+		background: var(--surface-selected);
+	}
+
+	.market-item.disabled {
+		opacity: 0.5;
+		filter: grayscale(1);
+	}
+
+	.market-item.incompatible {
+		border-left: 3px solid var(--color-error);
+	}
+
+	.market-item-icon {
+		width: var(--market-icon-size);
+		height: var(--market-icon-size);
+		border-radius: var(--border-radius-sm);
+		background: var(--surface-input);
+		border: var(--border-width) solid var(--border);
+		overflow: hidden;
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		align-self: start;
+		box-sizing: border-box;
+	}
+
+	.market-item-icon img {
+		width: 100%;
+		height: 100%;
+		object-fit: contain;
+	}
+
+	.market-item-body {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		justify-content: flex-start;
+		gap: 6px;
+		overflow: hidden;
+	}
+
+	.market-item-header {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 6px;
+		min-width: 0;
+	}
+
+	.market-item-title {
+		font-size: var(--market-title-size);
+		font-weight: var(--font-weight-bold);
+		color: var(--text-primary);
+		margin: 0;
+		display: -webkit-box;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		-webkit-box-orient: vertical;
+		line-height: 1.3;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+
+	.market-item-badges {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		flex-wrap: wrap;
+		flex-shrink: 0;
+	}
+
+	.market-item-badge {
+		font-size: 0.6rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		padding: 2px 6px;
+		border-radius: var(--border-radius-sm);
+		white-space: nowrap;
+	}
+
+	.market-item-badge.update {
+		color: var(--accent);
+		background: color-mix(in srgb, var(--accent) 10%, transparent);
+		border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+	}
+
+	.market-item-badge.incompatible {
+		color: var(--color-error);
+		background: color-mix(in srgb, var(--color-error) 8%, transparent);
+		border: var(--border-width) solid
+			color-mix(in srgb, var(--color-error) 25%, transparent);
+	}
+
+	.market-item-author {
+		font-size: 0.7rem;
+		color: var(--text-secondary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.market-item-description {
+		grid-column: 1 / -1;
+		min-height: 0;
+		font-size: var(--market-description-size);
+		color: var(--text-secondary);
+		line-height: var(--line-height);
+		display: -webkit-box;
+		-webkit-line-clamp: 3;
+		line-clamp: 3;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		margin: 0;
+		max-height: 100%;
+		overflow-wrap: anywhere;
+	}
+
+	.market-item-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		min-height: 28px;
+		gap: 6px;
+		flex-shrink: 0;
+		padding-top: 8px;
+		border-top: var(--border-width) solid var(--border);
+	}
+	.market-item-description.install-error {
+		color: var(--color-error);
+	}
+
+	.market-item-meta {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 4px 10px;
+		min-width: 0;
+	}
+
+	.market-item-source {
+		font-size: 0.65rem;
+		color: var(--text-tertiary, var(--text-secondary));
+	}
+
+	.market-item-downloads {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 0.7rem;
+		color: var(--text-secondary);
+		font-variant-numeric: tabular-nums;
+		white-space: nowrap;
+	}
+
+	.market-item-install-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		margin-inline-start: auto;
+		min-height: 30px;
+		padding: var(--market-button-padding);
+		background: var(--surface-selected);
+		color: var(--text-primary);
+		border: var(--border-width) solid var(--border);
+		border-radius: var(--border-radius-sm);
+		cursor: pointer;
+		font-size: 0.72rem;
+		font-weight: 700;
+		letter-spacing: 0.3px;
+		transition:
+			background-color 0.15s,
+			color 0.15s;
+		white-space: nowrap;
+	}
+
+	.market-item-install-btn:hover:not(:disabled) {
+		background: var(--accent);
+		color: var(--accent-text);
+	}
+
+	.market-item-install-btn:disabled {
+		opacity: 0.6;
+		cursor: wait;
+	}
+
+	.market-item-installed-badge {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 0.62rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		padding: 3px 8px;
+		border-radius: var(--border-radius-sm);
+		color: var(--color-success);
+		background: color-mix(in srgb, var(--color-success) 10%, transparent);
+		border: var(--border-width) solid
+			color-mix(in srgb, var(--color-success) 25%, transparent);
+		white-space: nowrap;
+	}
+	.market-item.list {
+		padding-block: 10px;
+		gap: 6px;
+	}
+	.list .market-item-open {
+		grid-template-rows: auto minmax(0, 1fr);
+		column-gap: var(--market-item-gap);
+		row-gap: 3px;
+	}
+	.list .market-item-icon {
+		grid-row: 1 / -1;
+	}
+	.list .market-item-header {
+		flex-direction: row;
+		align-items: center;
+	}
+	.list .market-item-title,
+	.list .market-item-description {
+		-webkit-line-clamp: 1;
+		line-clamp: 1;
+	}
+	.list .market-item-description {
+		grid-column: 2;
+	}
+	.list .market-item-actions {
+		padding-top: 6px;
+	}
+	@container market (min-width: 620px) {
+		.market-item.list {
+			flex-direction: row;
+			align-items: center;
+			gap: 16px;
+		}
+		.list .market-item-open {
+			align-content: center;
+			align-self: stretch;
+			grid-template-rows: auto auto;
+		}
+		.list .market-item-description {
+			-webkit-line-clamp: 2;
+			line-clamp: 2;
+		}
+		.list .market-item-actions {
+			flex-wrap: nowrap;
+			gap: 12px;
+			border-top: 0;
+			border-inline-start: var(--border-width) solid var(--border);
+			padding: 0 0 0 16px;
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.market-item,
+		.market-item-install-btn {
+			transition: none;
+		}
+	}
+</style>

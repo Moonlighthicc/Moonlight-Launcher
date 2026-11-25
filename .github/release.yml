@@ -1,0 +1,57 @@
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+    authors:
+      - github-actions
+
+  categories:
+    - title: Breaking Changes
+      labels:
+        - type:breaking
+
+    - title: New Features
+      labels:
+        - type:feature
+        - type:enhancement
+
+    - title: Core
+      labels:
+        - area:core
+
+    - title: User Interface
+      labels:
+        - area:ui
+
+    - title: Internationalization
+      labels:
+        - area:i18n
+
+    - title: Bug Fixes
+      labels:
+        - type:bug
+        - type:unconfirmed-bug
+        - type:patch
+
+    - title: Performance
+      labels:
+        - type:perf
+
+    - title: Tests
+      labels:
+        - type:test
+
+    - title: Documentation
+      labels:
+        - type:docs
+
+    - title: Maintenance
+      labels:
+        - type:chore
+        - type:refactor
+        - area:deps
+        - area:ci
+
+    - title: Other Changes
+      labels:
+        - "*"

@@ -1,0 +1,632 @@
+use super::launch::sanitize_sub_path;
+use super::launch::validate_uuid;
+use crate::core::errors::{FsError, InstanceError};
+use crate::core::{AppEvent, PathManager, emit, validate_filename};
+use crate::services::InstOverrides;
+use crate::services::InstanceManager;
+use crate::services::image_pipeline;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use tracing::{error, info, warn};
+
+#[tauri::command]
+pub async fn create_instance(
+    name: String,
+    version: String,
+    icon: Option<String>,
+) -> Result<String, String> {
+    info!(
+        "Creating instance: name={}, version={}, icon={:?}",
+        name, version, icon
+    );
+    match InstanceManager::get()
+        .create_instance(name, version, icon)
+        .await
+    {
+        Ok(d) => {
+            let uuid = d.uuid.to_string();
+            info!("Instance created: uuid={}", uuid);
+            emit(AppEvent::InstanceCreated {
+                id: uuid.clone().into(),
+                dto: d.to_dto().await,
+            });
+            Ok(uuid)
+        }
+        Err(e) => {
+            error!("Failed to create instance: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn delete_instance(id: String) -> Result<(), String> {
+    validate_uuid(&id)?;
+    info!("Deleting instance {}", id);
+    let manager = InstanceManager::get();
+    if manager.get_handle(&id).await.is_none() {
+        return Err(InstanceError::NotFound.to_string());
+    }
+    let result = manager.delete_instance(&id).await;
+    if let Err(ref e) = result {
+        error!("Failed to delete instance {}: {}", id, e);
+    } else {
+        info!("Instance {} deleted", id);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn open_instance_dir(id: String, sub_dir: Option<String>) -> Result<(), String> {
+    validate_uuid(&id)?;
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&id).await else {
+        warn!(
+            "Attempt to open directory of instance {} that was not found",
+            id
+        );
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    let _files_guard = handle.try_lock_files()?;
+    let instance_dir = handle.get_instance_dir().await;
+    let version = handle.get_version().await;
+
+    let path = match sub_dir {
+        Some(ref sub) => {
+            let name = crate::services::pack_dir::physical_pack_dir(&version, sub);
+            if name != sub.as_str() && !handle.is_busy() {
+                crate::services::pack_dir::migrate_legacy_packs(&instance_dir, &version).await?;
+            }
+            sanitize_sub_path(&instance_dir, Path::new(name))?
+        }
+        None => instance_dir,
+    };
+
+    info!("Opening directory: {:?}", path);
+
+    if !path.exists()
+        && let Err(e) = tokio::fs::create_dir_all(&path).await
+    {
+        error!("Could not create directory {:?}: {}", path, e);
+        return Err(FsError::CreateDir {
+            path: path.to_string_lossy().to_string(),
+            source: e,
+        }
+        .to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn rename_instance(id: String, new_name: String) -> Result<(), String> {
+    validate_uuid(&id)?;
+    info!("Renaming instance {} to '{}'", id, new_name);
+    let result = InstanceManager::get()
+        .update_instance(&id, Some(new_name), None, None, None)
+        .await;
+    if let Err(ref e) = result {
+        error!("Failed to rename instance {}: {}", id, e);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn update_instance(
+    id: String,
+    new_name: Option<String>,
+    new_version: Option<String>,
+    new_icon: Option<Option<String>>,
+    new_overrides: Option<InstOverrides>,
+) -> Result<(), String> {
+    validate_uuid(&id)?;
+    info!(
+        "Updating instance {}: name={:?}, version={:?}, icon={:?}",
+        id, new_name, new_version, new_icon
+    );
+    let result = InstanceManager::get()
+        .update_instance(&id, new_name, new_version, new_icon, new_overrides)
+        .await;
+    if let Err(ref e) = result {
+        error!("Failed to update instance {}: {}", id, e);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn pin_instance(id: String, pinned: bool) -> Result<(), String> {
+    validate_uuid(&id)?;
+    info!("Changing pin of instance {} to {}", id, pinned);
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&id).await else {
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    let files_guard = handle.try_lock_files()?;
+    handle.set_pinned(pinned).await;
+    files_guard
+        .save_if_dirty()
+        .await
+        .map_err(|e| format!("Failed to save the instance: {}", e))?;
+
+    let dto = handle.to_dto().await;
+    emit(AppEvent::InstanceEdited {
+        id: handle.uuid.to_string().into(),
+        dto: Some(dto),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_installed_versions() -> Vec<String> {
+    let shared_guard = crate::services::shared_storage::acquire().await;
+    let shared_dir = PathManager::get().get_shared_dir();
+    tokio::task::spawn_blocking(move || {
+        let _shared_guard = shared_guard;
+        crate::services::version_installation::installed_versions(&shared_dir)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn delete_instance_file(
+    id: String,
+    sub_dir: String,
+    filename: String,
+) -> Result<(), String> {
+    validate_uuid(&id)?;
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&id).await else {
+        warn!("Instance {} not found for file deletion", id);
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    let _files_guard = handle.try_lock_files()?;
+    if handle.is_busy() {
+        error!("Attempt to delete a file in busy instance {}", id);
+        return Err(InstanceError::Busy.to_string());
+    }
+
+    let instance_dir = handle.get_instance_dir().await;
+    let version = handle.get_version().await;
+    let sub_dir = crate::services::pack_dir::physical_pack_dir(&version, &sub_dir).to_string();
+    if sub_dir == crate::services::pack_dir::TEXTURE_PACKS {
+        crate::services::pack_dir::migrate_legacy_packs(&instance_dir, &version).await?;
+    }
+    let sub_path = sanitize_sub_path(&instance_dir, Path::new(&sub_dir))?;
+    validate_filename(&filename)?;
+    let file_path = sub_path.join(&filename);
+    crate::services::modpack::ensure_paths_mutable(
+        &instance_dir,
+        &[file_path
+            .strip_prefix(&instance_dir)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/")],
+    )
+    .await?;
+    info!("Deleting file {:?} from instance {}", file_path, id);
+    if file_path.exists() {
+        tokio::fs::remove_file(&file_path).await.map_err(|e| {
+            error!("Failed to delete file {:?}: {}", file_path, e);
+            FsError::Remove {
+                path: file_path.to_string_lossy().to_string(),
+                source: e,
+            }
+            .to_string()
+        })?;
+    } else {
+        warn!("File {:?} does not exist, nothing to delete", file_path);
+    }
+
+    // Clean up ablage cache if deleting from resource/texture packs or shaderpacks
+    let pack_dirs = ["resourcepacks", "texturepacks", "shaderpacks"];
+    if pack_dirs.contains(&sub_dir.as_str()) {
+        let sub_path2 = sub_path.clone();
+        let filename2 = filename.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::services::remove_pack_cache(&sub_path2, &filename2);
+        })
+        .await;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn add_instance_file(
+    id: String,
+    sub_dir: String,
+    source_path: String,
+    overwrite: Option<bool>,
+) -> Result<(), String> {
+    validate_uuid(&id)?;
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&id).await else {
+        warn!("Instance {} not found for adding a file", id);
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    let _files_guard = handle.try_lock_files()?;
+    if handle.is_busy() {
+        error!("Attempt to add a file to busy instance {}", id);
+        return Err(InstanceError::Busy.to_string());
+    }
+
+    let instance_dir = handle.get_instance_dir().await;
+    let version = handle.get_version().await;
+    let sub_dir = crate::services::pack_dir::physical_pack_dir(&version, &sub_dir).to_string();
+    if sub_dir == crate::services::pack_dir::TEXTURE_PACKS {
+        crate::services::pack_dir::migrate_legacy_packs(&instance_dir, &version).await?;
+    }
+    let dest_dir = sanitize_sub_path(&instance_dir, Path::new(&sub_dir))?;
+    info!(
+        "Adding file '{}' to instance {} in sub_dir '{}'",
+        source_path, id, sub_dir
+    );
+    let src = PathBuf::from(&source_path);
+    let filename = src
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| InstanceError::InvalidSourcePath.to_string())?;
+    validate_filename(filename)?;
+    let dest_path = dest_dir.join(filename);
+    crate::services::modpack::ensure_paths_mutable(
+        &instance_dir,
+        &[dest_path
+            .strip_prefix(&instance_dir)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/")],
+    )
+    .await?;
+    if !dest_dir.exists() {
+        tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
+            FsError::CreateDir {
+                path: dest_dir.to_string_lossy().to_string(),
+                source: e,
+            }
+            .to_string()
+        })?;
+    }
+
+    copy_instance_file(&src, &dest_path, overwrite.unwrap_or(true))
+        .await
+        .map_err(|e| {
+            error!("Failed to copy file to {:?}: {}", dest_path, e);
+            FsError::Copy {
+                from: src.to_string_lossy().to_string(),
+                to: dest_path.to_string_lossy().to_string(),
+                source: e,
+            }
+            .to_string()
+        })?;
+    info!("File copied to {:?}", dest_path);
+    Ok(())
+}
+
+async fn copy_instance_file(src: &Path, dest: &Path, overwrite: bool) -> std::io::Result<()> {
+    if overwrite {
+        tokio::fs::copy(src, dest).await?;
+        return Ok(());
+    }
+    let mut source = tokio::fs::File::open(src).await?;
+    let mut target = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .await?;
+    use tokio::io::AsyncWriteExt;
+    let result = async {
+        tokio::io::copy(&mut source, &mut target).await?;
+        target.flush().await
+    }
+    .await;
+    if let Err(error) = result {
+        drop(target);
+        let _ = tokio::fs::remove_file(dest).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "../../tests/commands/instance/manage.rs"]
+mod tests;
+
+#[tauri::command]
+pub async fn upload_custom_icon(
+    instance_id: String,
+    source_path: String,
+) -> Result<String, String> {
+    validate_uuid(&instance_id)?;
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&instance_id).await else {
+        warn!("Instance {} not found for icon upload", instance_id);
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    if handle.is_busy() {
+        error!(
+            "Attempt to upload an icon on busy instance {}",
+            instance_id
+        );
+        return Err(InstanceError::Busy.to_string());
+    }
+
+    let src = PathBuf::from(&source_path);
+    let metadata = tokio::fs::metadata(&src).await.map_err(|e| {
+        format!(
+            "File '{}' does not exist or cannot be read: {}",
+            source_path, e
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!("'{}' is not a file", source_path));
+    }
+
+    // Decodificar y reescalar fuera del lock: es CPU-bound y puede tardar.
+    let normalized = tokio::task::spawn_blocking(move || image_pipeline::normalize_icon_file(&src))
+        .await
+        .map_err(|e| format!("Could not process the icon: {e}"))??;
+
+    let files_guard = handle.try_lock_files()?;
+    if handle.is_busy() {
+        error!(
+            "Attempt to upload an icon on busy instance {}",
+            instance_id
+        );
+        return Err(InstanceError::Busy.to_string());
+    }
+
+    let instance_dir = handle.get_instance_dir().await;
+    let icons_dir = instance_dir.join("icons");
+    let store_dir = icons_dir.clone();
+    let dest_path = tokio::task::spawn_blocking(move || {
+        image_pipeline::store_normalized_icon(&store_dir, &normalized)
+    })
+    .await
+    .map_err(|e| format!("Could not save the icon: {e}"))??;
+
+    let previous_icon = handle.get_icon().await;
+    handle
+        .set_icon(Some(dest_path.to_string_lossy().to_string()))
+        .await;
+    if let Err(error) = files_guard.save_if_dirty().await {
+        // Dejar la instancia como estaba; el archivo nuevo es inofensivo.
+        handle
+            .set_icon(previous_icon.as_ref().map(|icon| icon.to_string()))
+            .await;
+        error!("Failed to save instance after uploading icon: {}", error);
+        return Err(error.to_string());
+    }
+
+    // La escritura ya está confirmada; borrar los anteriores es best-effort.
+    let cleanup_dir = icons_dir;
+    let keep = dest_path.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        image_pipeline::remove_icon_files(&cleanup_dir, Some(&keep))
+    })
+    .await;
+
+    emit(AppEvent::InstanceEdited {
+        id: handle.uuid.to_string().into(),
+        dto: None,
+    });
+    info!("Custom icon uploaded to {:?}", dest_path);
+
+    Ok(dest_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn reset_instance_icon(instance_id: String) -> Result<(), String> {
+    validate_uuid(&instance_id)?;
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&instance_id).await else {
+        warn!(
+            "Instance {} not found for icon reset",
+            instance_id
+        );
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    let files_guard = handle.try_lock_files()?;
+    if handle.is_busy() {
+        error!(
+            "Attempt to reset the icon on busy instance {}",
+            instance_id
+        );
+        return Err(InstanceError::Busy.to_string());
+    }
+
+    // Persistir el cambio antes de borrar archivos: si falla el guardado, el
+    // icono actual sigue existiendo y la instancia no queda rota.
+    let previous_icon = handle.get_icon().await;
+    handle.set_icon(None).await;
+    if let Err(error) = files_guard.save_if_dirty().await {
+        handle
+            .set_icon(previous_icon.as_ref().map(|icon| icon.to_string()))
+            .await;
+        error!("Failed to save instance after resetting icon: {}", error);
+        return Err(error.to_string());
+    }
+
+    let instance_dir = handle.get_instance_dir().await;
+    let icons_dir = instance_dir.join("icons");
+    let _ =
+        tokio::task::spawn_blocking(move || image_pipeline::remove_icon_files(&icons_dir, None))
+            .await;
+
+    emit(AppEvent::InstanceEdited {
+        id: handle.uuid.to_string().into(),
+        dto: None,
+    });
+    info!("Icon reset for instance {}", instance_id);
+    Ok(())
+}
+
+// ─── Dependency checks ───────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+pub struct VersionIntegrity {
+    pub version_id: String,
+    pub dependencies: Vec<String>,
+    pub missing: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Serialize, Clone)]
+pub struct VersionStatus {
+    pub version_id: String,
+    pub complete: bool,
+    pub missing_deps: Vec<String>,
+}
+
+/// Check if a version and all its dependencies are fully installed.
+#[tauri::command]
+pub async fn check_version_integrity(version_id: String) -> Result<VersionIntegrity, String> {
+    let shared_guard = crate::services::shared_storage::acquire().await;
+    let shared_dir = PathManager::get().get_shared_dir();
+    let dependencies = zellkern::resolve_dependencies(&version_id);
+    let requested = version_id.clone();
+    let missing = tokio::task::spawn_blocking(move || {
+        let _shared_guard = shared_guard;
+        crate::services::version_installation::missing_dependencies(&shared_dir, &requested)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let complete = missing.is_empty();
+
+    Ok(VersionIntegrity {
+        version_id,
+        dependencies,
+        missing,
+        complete,
+    })
+}
+
+/// List all installed versions with their integrity status.
+#[tauri::command]
+pub async fn get_installed_versions_with_status() -> Vec<VersionStatus> {
+    let shared_guard = crate::services::shared_storage::acquire().await;
+    let versions_dir = PathManager::get().get_shared_dir().join("versions");
+    let shared_dir = PathManager::get().get_shared_dir();
+
+    let listing_guard = shared_guard.clone();
+    let versions = tokio::task::spawn_blocking(move || -> Vec<String> {
+        let _shared_guard = listing_guard;
+        match std::fs::read_dir(&versions_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    })
+    .await
+    .unwrap_or_default();
+
+    tokio::task::spawn_blocking(move || {
+        let _shared_guard = shared_guard;
+        versions
+            .into_iter()
+            .map(|v| {
+                let missing =
+                    crate::services::version_installation::missing_dependencies(&shared_dir, &v);
+                VersionStatus {
+                    version_id: v,
+                    complete: missing.is_empty(),
+                    missing_deps: missing,
+                }
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn delete_installed_version(version_id: String) -> Result<(), String> {
+    zellkern::path_security::validate_version(&version_id).map_err(|e| e.to_string())?;
+    let exclusive = crate::services::shared_storage::try_exclusive()?;
+    if crate::services::shared_storage::shared_is_busy().await.is_some() {
+        return Err("Close running games and wait for downloads before deleting a version".into());
+    }
+    let shared = PathManager::get().get_shared_dir();
+    tokio::task::spawn_blocking(move || {
+        let _exclusive = exclusive;
+        let result = zellkern::path_security::ConfinedDir::open(&shared)
+            .and_then(|root| root.open_dir(Path::new("versions")))
+            .and_then(|versions| versions.remove_dir_all(Path::new(&version_id)));
+        crate::services::version_installation::invalidate_installed_versions_cache();
+        match result {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn reinstall_version(version: String) -> Result<(), String> {
+    let exclusive = crate::services::shared_storage::try_exclusive()?;
+    tokio::spawn(async move {
+        let exclusive = exclusive;
+        info!("Reinstalling version: {}", version);
+        let shared_dir = PathManager::get().get_shared_dir();
+        let deps = zellkern::resolve_dependencies(&version);
+
+        for dep in &deps {
+            let version_dir = shared_dir.join(format!("versions/{}", dep));
+            if version_dir.exists() {
+                info!("Deleting version directory: {:?}", version_dir);
+                tokio::fs::remove_dir_all(&version_dir).await.map_err(|e| {
+                    error!("Failed to delete version {}: {}", dep, e);
+                    e.to_string()
+                })?;
+            }
+        }
+        crate::services::version_installation::invalidate_installed_versions_cache();
+
+        drop(exclusive);
+        crate::services::DownloadQueue::get()
+            .enqueue(version.clone())
+            .await;
+        info!("Version {} queued for re-download", version);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

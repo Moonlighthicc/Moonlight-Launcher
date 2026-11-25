@@ -1,0 +1,47 @@
+mod addon_manager;
+pub(crate) mod curseforge_api;
+pub(crate) mod curseforge_modpack;
+pub mod dependency_resolver;
+pub(crate) mod discord_presence;
+pub(crate) mod download_queue;
+pub(crate) mod icon_protocol;
+pub(crate) mod image_pipeline;
+pub mod instance_export;
+pub mod instance_import;
+pub(crate) mod instance_manager;
+pub(crate) mod interface_preferences;
+pub(crate) mod java_manager;
+pub(crate) mod launch_window;
+pub(crate) mod launcher;
+pub mod launcher_cache;
+pub(crate) mod market_icon_cache;
+pub(crate) mod minecraft_jar;
+pub mod mod_versions;
+pub mod modpack;
+pub mod modpack_update;
+pub mod mrpack_export;
+pub(crate) mod notification_preferences;
+pub mod options_profiles;
+pub mod pack_dir;
+pub mod server_manager;
+#[cfg(test)]
+#[path = "../tests/services/server_performance.rs"]
+mod server_performance_tests;
+pub mod server_status;
+pub(crate) mod settings_manager;
+pub mod shared_storage;
+pub mod skin_closet_manager;
+pub(crate) mod storage_migration;
+pub(crate) mod version_installation;
+pub mod world_manager;
+
+pub use addon_manager::*;
+pub use download_queue::{DownloadQueue, DownloadState};
+pub use instance_import::{
+    InstanceImportPlan, cancel_preview, detect_instance_zip, import_instance_zip,
+};
+pub use instance_manager::{
+    InstOverrides, InstanceDto, InstanceHandle, InstanceManager, InstanceStatus, signal_kill, signal_kill_process, has_running_processes, running_process_ids,
+};
+pub use launcher::Launcher;
+pub use settings_manager::{SettingsManager, SettingsSnapshot};

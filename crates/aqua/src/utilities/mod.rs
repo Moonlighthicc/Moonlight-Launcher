@@ -1,0 +1,708 @@
+use std::path::Path;
+use std::sync::LazyLock;
+
+use log::{debug, error, warn};
+use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
+use tokio::io::AsyncWriteExt;
+
+#[cfg(test)]
+use zellkern::is_native_file;
+
+use crate::AquaError;
+
+pub static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .user_agent("Cubic Proton/2.0")
+        // Timeouts cortos: con VPN/red inestable un socket muerto no debe dejar
+        // la descarga colgada en "Подключение" decenas de segundos.
+        .connect_timeout(std::time::Duration::from_secs(6))
+        .read_timeout(std::time::Duration::from_secs(15))
+        // Detecta conexiones rotas (cambio de VPN / red) en pocos segundos.
+        .tcp_keepalive(std::time::Duration::from_secs(5))
+        .tcp_nodelay(true)
+        // Las conexiones inactivas se descartan pronto para no reutilizar un
+        // socket que quedó huérfano tras apagar/encender la red o la VPN.
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        // Keep idle sockets from pinning buffers across long launcher sessions.
+        .pool_max_idle_per_host(16)
+        .build()
+        .expect("Failed to build reqwest client")
+});
+
+const MAX_DOWNLOAD_ATTEMPTS: usize = 4;
+
+/// Tiempo máximo de espera de las cabeceras de una respuesta antes de reintentar.
+const REQUEST_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// Intentos por URL para peticiones pequeñas (manifiestos, índices).
+const FETCH_ATTEMPTS: usize = 3;
+
+/// Si no llegan cabeceras tras este tiempo se lanza una segunda petición en
+/// paralelo (conexión nueva). Con VPN/red inestable, la primera suele quedar en
+/// un socket muerto; así se recupera en ~2 s en vez de esperar al timeout.
+const HEDGE_DELAY: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Envía la petición y, si tarda en responder, compite con una copia.
+pub(crate) async fn hedged_send(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let Some(second_req) = request.try_clone() else {
+        return request.send().await;
+    };
+    let first = request.send();
+    tokio::pin!(first);
+    tokio::select! {
+        r = &mut first => return r,
+        _ = tokio::time::sleep(HEDGE_DELAY) => {}
+    }
+    let second = second_req.send();
+    tokio::pin!(second);
+    tokio::select! {
+        r = &mut first => match r {
+            Ok(resp) => Ok(resp),
+            Err(_) => second.await,
+        },
+        r = &mut second => match r {
+            Ok(resp) => Ok(resp),
+            Err(_) => first.await,
+        },
+    }
+}
+
+/// Petición GET respetando el proveedor activo: intenta primero el espejo
+/// BMCLAPI (si aplica) y cae al servidor oficial como respaldo.
+pub(crate) async fn get_with_fallback(
+    client: &Client,
+    url: &str,
+) -> Result<reqwest::Response, AquaError> {
+    let candidates = crate::provider::preferred_urls(url);
+    let mut last_error: Option<AquaError> = None;
+    for candidate in &candidates {
+        let is_mirror = crate::provider::is_mirror_url(candidate);
+        // El espejo en cooldown se salta silenciosamente; el oficial lo respalda.
+        if is_mirror && crate::provider::mirror_cooldown_active() {
+            continue;
+        }
+        let _permit = if is_mirror {
+            match crate::provider::acquire_mirror_permit().await {
+                Some(permit) => Some(permit),
+                None => continue,
+            }
+        } else {
+            None
+        };
+        // El espejo se intenta una sola vez (el oficial lo respalda); el oficial reintenta.
+        let attempts = if is_mirror { 1 } else { FETCH_ATTEMPTS };
+        for attempt in 1..=attempts {
+            let sent = tokio::time::timeout(REQUEST_HEADERS_TIMEOUT, hedged_send(client.get(candidate)))
+                .await;
+            match sent {
+                Ok(Ok(resp)) if resp.status().is_success() => return Ok(resp),
+                Ok(Ok(resp)) => {
+                    if is_mirror && resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        crate::provider::note_mirror_rate_limited(retry_after_secs(&resp));
+                    }
+                    let client_error = resp.status().is_client_error();
+                    last_error = Some(AquaError::Other(format!(
+                        "HTTP {} for {candidate}",
+                        resp.status()
+                    )));
+                    // Un 4xx no mejora reintentando.
+                    if client_error {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => last_error = Some(AquaError::RequestError(e)),
+                Err(_) => {
+                    last_error = Some(AquaError::Other(format!(
+                        "Timed out for {candidate}"
+                    )))
+                }
+            }
+            if attempt < attempts {
+                warn!("Request failed ({attempt}/{attempts}) for {candidate}, retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| AquaError::Other("Request failed".into())))
+}
+
+/// Publish fetched metadata only after the batch has completed successfully.
+pub(crate) async fn write_metadata(path: &Path, bytes: &[u8]) -> Result<(), AquaError> {
+    let temporary = path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, path).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result.map_err(AquaError::from)
+}
+
+/// Hasher polimórfico para la verificación de descargas.
+///
+/// El launcher convive con hashes SHA-1 (assets de Minecraft, 40 caracteres
+/// hex) y SHA-256 (paquetes de JRE, 64 caracteres), así que el algoritmo se
+/// elige según la longitud del hash esperado. Cualquier longitud desconocida
+/// se trata como SHA-1 para conservar el comportamiento previo.
+enum FileHasher {
+    Sha1(Sha1),
+    Sha256(Sha256),
+}
+
+impl FileHasher {
+    fn for_hash(expected_hash: &str) -> Self {
+        if expected_hash.len() == 64 {
+            Self::Sha256(Sha256::new())
+        } else {
+            Self::Sha1(Sha1::new())
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Sha1(hasher) => hasher.update(data),
+            Self::Sha256(hasher) => hasher.update(data),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        match self {
+            Self::Sha1(hasher) => hex_encode(hasher.finalize().as_slice()),
+            Self::Sha256(hasher) => hex_encode(hasher.finalize().as_slice()),
+        }
+    }
+}
+
+/// Abstraction over any progress reporter that can track bytes for a single
+/// download item. Allows the shared download loop to be reused by callers
+/// that need different progress backends (e.g. a shared `ProgressState` or
+/// a watch channel for JRE installs).
+pub trait ProgressReporter: Send + Sync {
+    fn connecting(&self) {}
+    fn response_ready(&self) {}
+    fn reset_attempt(&self);
+    fn report_delta(&self, delta: u64);
+    /// El archivo ya estaba completo en disco: `size` bytes están listos.
+    fn commit_known_size(&self, size: u64);
+    /// El servidor informó el tamaño real (Content-Length). Solo corrige el total esperado.
+    fn learn_total(&self, _size: u64) {}
+    /// La descarga del ítem terminó con éxito: fija el total al tamaño recibido.
+    fn settle(&self) {}
+}
+
+/// Tamaño actual de un archivo en disco, si se puede leer.
+async fn file_len(path: &Path) -> Option<u64> {
+    tokio::fs::metadata(path).await.ok().map(|m| m.len())
+}
+
+pub async fn download_file(
+    url: &str,
+    path: &Path,
+    expected_hash: &str,
+    size_hint: Option<u64>,
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<(), AquaError> {
+    download_file_with_headers(url, path, expected_hash, size_hint, reporter, &[]).await
+}
+
+pub async fn download_file_with_headers(
+    url: &str,
+    path: &Path,
+    expected_hash: &str,
+    size_hint: Option<u64>,
+    reporter: Option<&dyn ProgressReporter>,
+    headers: &[(String, String)],
+) -> Result<(), AquaError> {
+    if url.is_empty() {
+        return Err(AquaError::Other("Empty download URL".into()));
+    }
+
+    // Verify existing file
+    if path.exists() {
+        if !expected_hash.is_empty() {
+            match verify_file_hash(path, expected_hash).await {
+                Ok(true) => {
+                    debug!("File OK (hash match): {:?}", path);
+                    if let Some(r) = reporter {
+                        let size = file_len(path).await.or(size_hint).unwrap_or(0);
+                        r.commit_known_size(size);
+                    }
+                    return Ok(());
+                }
+                Ok(false) => {
+                    warn!("Hash mismatch, re-downloading: {:?}", path);
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                Err(e) => {
+                    warn!("Verify failed, re-downloading: {}", e);
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+            }
+        } else {
+            debug!("File exists (no hash to verify): {:?}", path);
+            if let Some(r) = reporter {
+                let size = file_len(path).await.or(size_hint).unwrap_or(0);
+                r.commit_known_size(size);
+            }
+            return Ok(());
+        }
+    }
+
+    if let Some(r) = reporter {
+        r.connecting();
+    }
+
+    // El proveedor BMCLAPI devuelve [espejo, oficial]; el oficial, solo [url].
+    let candidates = crate::provider::preferred_urls(url);
+    let mut last_error: Option<AquaError> = None;
+
+    for candidate in &candidates {
+        let is_mirror = crate::provider::is_mirror_url(candidate);
+        // El espejo en cooldown se salta sin ruido; el oficial lo respalda.
+        if is_mirror && crate::provider::mirror_cooldown_active() {
+            continue;
+        }
+        // Ante cualquier fallo del espejo se cae al oficial de inmediato, que ya
+        // aplica sus propios reintentos. El oficial conserva los 3 intentos.
+        let attempts = if is_mirror { 1 } else { MAX_DOWNLOAD_ATTEMPTS };
+        match download_single_url(candidate, path, expected_hash, reporter, headers, attempts).await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if candidates.len() > 1 {
+                    warn!("Download from {} failed: {e}", candidate);
+                }
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| AquaError::Other("Download failed".into())))
+}
+
+async fn download_single_url(
+    url: &str,
+    path: &Path,
+    expected_hash: &str,
+    reporter: Option<&dyn ProgressReporter>,
+    headers: &[(String, String)],
+    max_attempts: usize,
+) -> Result<(), AquaError> {
+    let is_mirror = crate::provider::is_mirror_url(url);
+
+    // El permiso se mantiene durante toda la descarga, de modo que solo haya
+    // `MIRROR_MAX_CONCURRENCY` descargas simultáneas contra el espejo.
+    let _permit = if is_mirror {
+        match crate::provider::acquire_mirror_permit().await {
+            Some(permit) => Some(permit),
+            None => return Err(AquaError::Other("BMCLAPI on cooldown".into())),
+        }
+    } else {
+        None
+    };
+
+    let temp_file = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+
+    for attempt in 1..=max_attempts {
+        // Clean temp from previous attempts
+        let _ = tokio::fs::remove_file(&temp_file).await;
+
+        if let Some(r) = reporter {
+            r.connecting();
+            r.reset_attempt();
+        }
+
+        let mut request = HTTP_CLIENT.get(url);
+        if !headers.is_empty() {
+            let mut header_map = HeaderMap::new();
+            for (k, v) in headers {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_str(v),
+                ) {
+                    header_map.insert(name, value);
+                }
+            }
+            request = request.headers(header_map);
+        }
+        let response = match tokio::time::timeout(REQUEST_HEADERS_TIMEOUT, hedged_send(request)).await {
+            Ok(Ok(r)) if r.status().is_success() => r,
+            Ok(Ok(r)) => {
+                // El WAF de BMCLAPI limita por IP: abrimos el circuito y dejamos
+                // que el llamador use el servidor oficial sin reintentar.
+                if is_mirror && r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    crate::provider::note_mirror_rate_limited(retry_after_secs(&r));
+                    return Err(AquaError::Other("BMCLAPI rate limit (429)".into()));
+                }
+                let status = r.status();
+                if status.is_client_error()
+                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
+                    return Err(AquaError::Other(format!("HTTP {status}")));
+                }
+                warn!(
+                    "HTTP {} on attempt {}/{}",
+                    r.status(),
+                    attempt,
+                    max_attempts
+                );
+                if attempt == max_attempts {
+                    return Err(AquaError::Other(format!("HTTP {}", r.status())));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << (attempt - 1))))
+                    .await;
+                continue;
+            }
+            Err(_) => {
+                warn!("Request timed out attempt {}/{}", attempt, max_attempts);
+                if attempt == max_attempts {
+                    return Err(AquaError::Other("Request timed out".into()));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << (attempt - 1))))
+                    .await;
+                continue;
+            }
+            Ok(Err(e)) => {
+                warn!("Request failed attempt {}/{}: {}", attempt, max_attempts, e);
+                if attempt == max_attempts {
+                    return Err(AquaError::RequestError(e));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << (attempt - 1))))
+                    .await;
+                continue;
+            }
+        };
+
+        if let Some(r) = reporter {
+            r.response_ready();
+        }
+
+        // El tamaño real llega con las cabeceras: se usa solo para corregir el
+        // total esperado. Los bytes se cuentan al recibir el cuerpo, una sola vez.
+        if let (Some(reporter), Some(content_length)) = (reporter, response.content_length()) {
+            reporter.learn_total(content_length);
+        }
+
+        let mut file = match tokio::fs::File::create(&temp_file).await {
+            Ok(f) => f,
+            Err(e) => return Err(AquaError::IoError(e)),
+        };
+
+        let mut hasher = FileHasher::for_hash(expected_hash);
+        let mut stream = response.bytes_stream();
+
+        use futures::StreamExt;
+        let mut write_ok = true;
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    let len = chunk.len() as u64;
+                    hasher.update(&chunk);
+                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
+                        error!("Write error: {}", e);
+                        write_ok = false;
+                        break;
+                    }
+                    if let Some(r) = reporter {
+                        r.report_delta(len);
+                    }
+                }
+                Err(e) => {
+                    warn!("Stream error on attempt {}: {}", attempt, e);
+                    write_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if !write_ok {
+            let _ = tokio::fs::remove_file(&temp_file).await;
+            if attempt == max_attempts {
+                return Err(AquaError::Other("Download stream failed".into()));
+            }
+            continue;
+        }
+
+        file.flush().await?;
+
+        // Verify hash if provided
+        if !expected_hash.is_empty() {
+            let actual_hash = hasher.finalize_hex();
+            if actual_hash != expected_hash {
+                warn!(
+                    "Hash mismatch attempt {}/{}: expected={}, got={}",
+                    attempt, max_attempts, expected_hash, actual_hash
+                );
+                let _ = tokio::fs::remove_file(&temp_file).await;
+                if attempt == max_attempts {
+                    return Err(AquaError::HashMismatch {
+                        expected: expected_hash.to_string(),
+                        actual: actual_hash,
+                    });
+                }
+                continue;
+            }
+        }
+
+        if let Some(r) = reporter {
+            r.settle();
+        }
+
+        // Atomic rename
+        tokio::fs::rename(&temp_file, path).await?;
+        debug!("Downloaded: {:?}", path);
+        return Ok(());
+    }
+
+    Err(AquaError::Other("Download failed after retries".into()))
+}
+
+/// Lee el cooldown indicado por el servidor en `Retry-After` (o en la variante
+/// no estándar `retry-after-short` que usa el WAF de BMCLAPI), en segundos.
+/// Devuelve `0` si no hay cabecera o no es un número entero.
+fn retry_after_secs(resp: &reqwest::Response) -> u64 {
+    for key in ["retry-after", "retry-after-short"] {
+        if let Some(value) = resp.headers().get(key)
+            && let Ok(text) = value.to_str()
+            && let Ok(secs) = text.trim().parse::<u64>()
+        {
+            return secs;
+        }
+    }
+    0
+}
+
+pub async fn verify_file_hash(path: &Path, expected_hash: &str) -> Result<bool, AquaError> {
+    let path = path.to_path_buf();
+    let expected = expected_hash.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = std::io::BufReader::with_capacity(1 << 18, std::fs::File::open(&path)?);
+        let mut hasher = FileHasher::for_hash(&expected);
+        let mut buf = [0u8; 1 << 16];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok::<_, AquaError>(hasher.finalize_hex() == expected)
+    })
+    .await?
+}
+
+#[cfg(feature = "extract-natives")]
+pub(crate) fn extract_native_jar_sync(jar_path: &Path, destino: &Path) -> Result<(), AquaError> {
+    if !jar_path.exists() {
+        return Err(AquaError::Other(format!(
+            "Native JAR not found: {:?}",
+            jar_path
+        )));
+    }
+    std::fs::create_dir_all(destino)?;
+    zellkern::extract_jar(jar_path, destino)
+        .map_err(|e| AquaError::Other(format!("Failed to extract native JAR: {e}")))
+}
+
+#[cfg(feature = "extract-natives")]
+pub async fn extract_native(jar_path: &Path, destino: &Path) -> Result<(), AquaError> {
+    let jar_path = jar_path.to_path_buf();
+    let destino = destino.to_path_buf();
+
+    tokio::task::spawn_blocking(move || extract_native_jar_sync(&jar_path, &destino)).await?
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+// ─── Java utilities ─────────────────────────────────────────────────────────
+
+/// Parses the major version number from a `java -version` output line such as
+/// `openjdk version "21.0.11"` or `openjdk version "1.8.0_412"`.
+pub fn parse_java_major_version(version_line: &str) -> Option<u8> {
+    let version_token = version_line.lines().next()?.split('"').nth(1).or_else(|| {
+        version_line
+            .split_whitespace()
+            .find(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    })?;
+
+    let version_token = version_token.trim();
+
+    // Legacy format: "1.8.0_xxx" -> major is 8.
+    if let Some(rest) = version_token.strip_prefix("1.") {
+        let major_str = rest.split('.').next()?;
+        return major_str.parse().ok();
+    }
+
+    version_token.split('.').next()?.parse().ok()
+}
+
+fn parse_mc_major_minor(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
+/// Returns the preferred Java runtime versions for a given Minecraft version.
+/// The first element is the optimal version; later entries are acceptable
+/// fallbacks if the optimal one is not installed.
+pub fn java_runtime_preferences(mc_version: &str) -> &'static [u8] {
+    match parse_mc_major_minor(mc_version) {
+        Some((1, n)) if n >= 21 => &[21, 17, 8],
+        Some((1, n)) if n >= 17 => &[17, 21, 8],
+        Some((1, _)) => &[8, 17, 21],
+        // Year-based and snapshot versions default to the most recent LTS Java.
+        _ => &[21, 17, 8],
+    }
+}
+
+/// Infers the single required Java major version for a Minecraft version.
+/// This is used when the version manifest does not declare `java_version`.
+pub fn infer_java_version(mc_version: &str) -> u8 {
+    java_runtime_preferences(mc_version)
+        .first()
+        .copied()
+        .unwrap_or(21)
+}
+
+// ─── Forge utilities ──────────────────────────────────────────────────────────
+
+/// Extract a ZIP file to a destination directory (all files, no filtering).
+pub fn extract_zip_to_dir(zip_path: &Path, dest_dir: &Path) -> Result<(), AquaError> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| AquaError::ForgeExtract(format!("Cannot open ZIP: {e}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AquaError::ForgeExtract(format!("Invalid ZIP: {e}")))?;
+
+    zellkern::path_security::extract_zip(&mut archive, dest_dir)
+        .map_err(|e| AquaError::ForgeExtract(e.to_string()))?;
+    Ok(())
+}
+
+/// Read the Main-Class attribute from a JAR file's META-INF/MANIFEST.MF.
+pub fn read_jar_main_class(jar_path: &Path) -> Result<String, AquaError> {
+    let file = std::fs::File::open(jar_path).map_err(|e| AquaError::ForgeProcessor {
+        processor: jar_path.display().to_string(),
+        detail: format!("Cannot open JAR: {e}"),
+    })?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| AquaError::ForgeProcessor {
+        processor: jar_path.display().to_string(),
+        detail: format!("Invalid JAR: {e}"),
+    })?;
+
+    let manifest =
+        archive
+            .by_name("META-INF/MANIFEST.MF")
+            .map_err(|e| AquaError::ForgeProcessor {
+                processor: jar_path.display().to_string(),
+                detail: format!("No MANIFEST.MF: {e}"),
+            })?;
+
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut std::io::BufReader::new(manifest), &mut content).map_err(
+        |e| AquaError::ForgeProcessor {
+            processor: jar_path.display().to_string(),
+            detail: format!("Cannot read MANIFEST.MF: {e}"),
+        },
+    )?;
+
+    for line in content.lines() {
+        if let Some(mc) = line.strip_prefix("Main-Class:") {
+            return Ok(mc.trim().to_string());
+        }
+    }
+
+    Err(AquaError::ForgeProcessor {
+        processor: jar_path.display().to_string(),
+        detail: "No Main-Class in MANIFEST.MF".into(),
+    })
+}
+
+/// Run a Java process synchronously (blocking). Used for Forge post-processors.
+pub async fn run_java_process(
+    java_path: &Path,
+    classpath: &str,
+    main_class: &str,
+    args: Vec<String>,
+    processor_name: &str,
+) -> Result<(), AquaError> {
+    let java_path = java_path.to_path_buf();
+    let classpath = classpath.to_string();
+    let main_class = main_class.to_string();
+    let processor_name = processor_name.to_string();
+
+    let status = tokio::process::Command::new(&java_path)
+        .arg("-cp")
+        .arg(&classpath)
+        .arg(&main_class)
+        .args(&args)
+        .status()
+        .await
+        .map_err(|e| AquaError::ForgeProcessor {
+            processor: processor_name.clone(),
+            detail: format!("Failed to start Java: {e}"),
+        })?;
+
+    if !status.success() {
+        return Err(AquaError::ForgeProcessor {
+            processor: processor_name,
+            detail: format!("Process exited with code {}", status.code().unwrap_or(-1)),
+        });
+    }
+
+    Ok(())
+}
+
+/// Compute SHA1 hash of a file (synchronous, for post-processor output verification).
+pub fn compute_sha1_sync(path: &Path) -> Result<String, AquaError> {
+    use sha1::{Digest, Sha1};
+
+    let mut file = std::fs::File::open(path).map_err(|e| AquaError::ForgeOutputVerification {
+        file: path.display().to_string(),
+        expected: "N/A".into(),
+        actual: format!("Cannot open file: {e}"),
+    })?;
+    let mut hasher = Sha1::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf).map_err(|e| {
+            AquaError::ForgeOutputVerification {
+                file: path.display().to_string(),
+                expected: "N/A".into(),
+                actual: format!("Read error: {e}"),
+            }
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_encode(hasher.finalize().as_slice()))
+}
+
+#[cfg(test)]
+#[path = "../tests/utilities.rs"]
+mod tests;

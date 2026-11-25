@@ -1,0 +1,109 @@
+<script lang="ts">
+	import Icon from "$lib/icons/Icon.svelte";
+
+	let {
+		currentStep = $bindable(0),
+		totalSteps = 2,
+		labels = [],
+	}: {
+		currentStep: number;
+		totalSteps?: number;
+		labels?: string[];
+	} = $props();
+</script>
+
+<div class="step-indicator">
+	{#each { length: totalSteps } as _, i (i)}
+		{@const active = i === currentStep}
+		{@const done = i < currentStep}
+		<div class="step-item">
+			<div class="step-dot" class:active class:done>
+				{#if done}
+					<Icon name="ui:check" size={12} />
+				{:else}
+					<span>{i + 1}</span>
+				{/if}
+			</div>
+			{#if labels[i]}
+				<span class="step-label" class:active class:done
+					>{labels[i]}</span
+				>
+			{/if}
+		</div>
+		{#if i < totalSteps - 1}
+			<div class="step-line" class:done></div>
+		{/if}
+	{/each}
+</div>
+
+<style>
+	.step-indicator {
+		display: flex;
+		align-items: center;
+		gap: 0;
+		padding: 4px 0 12px;
+	}
+
+	.step-item {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 4px;
+	}
+
+	.step-dot {
+		width: 28px;
+		height: 28px;
+		border-radius: 50%;
+		background: rgba(var(--accent-rgb, 255, 255, 255), 0.06);
+		border: 2px solid var(--border);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 0.7rem;
+		font-weight: 700;
+		color: var(--text-secondary);
+		transition: all 0.2s;
+		flex-shrink: 0;
+	}
+
+	.step-dot.active {
+		border-color: var(--accent);
+		color: var(--accent);
+		background: rgba(var(--accent-rgb, 255, 255, 255), 0.12);
+	}
+
+	.step-dot.done {
+		border-color: var(--accent);
+		background: var(--accent);
+		color: var(--accent-text, #0c0c0c);
+	}
+
+	.step-line {
+		flex: 1;
+		height: 2px;
+		background: var(--border);
+		margin: 0 8px;
+		transition: background 0.2s;
+	}
+
+	.step-line.done {
+		background: var(--accent);
+	}
+
+	.step-label {
+		font-size: 0.65rem;
+		font-weight: 600;
+		color: var(--text-secondary);
+		white-space: nowrap;
+		transition: color 0.2s;
+	}
+
+	.step-label.active {
+		color: var(--accent);
+	}
+
+	.step-label.done {
+		color: var(--accent);
+	}
+</style>

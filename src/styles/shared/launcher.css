@@ -1,0 +1,70 @@
+:root {
+	--launcher-radius: 14px;
+	--launcher-control-radius: 9px;
+	--launcher-surface: color-mix(in srgb, var(--bg-card) 58%, var(--bg-main));
+	--launcher-veil: color-mix(in srgb, var(--bg-main) 82%, transparent);
+	--launcher-glow: color-mix(in srgb, var(--accent) 13%, transparent);
+	--launcher-selected: color-mix(in srgb, var(--accent) 16%, var(--launcher-surface));
+	--launcher-item-hover: color-mix(in srgb, var(--accent) 11%, var(--launcher-surface));
+	--launcher-hover-overlay: color-mix(in srgb, var(--accent) 9%, transparent);
+	--launcher-hover-border: color-mix(in srgb, var(--accent) 40%, var(--text-primary));
+}
+
+/* Keep shared interaction colors tied to the live accent, even when a theme
+   supplies its own neutral surfaces at :root. Resting card/input colors stay theme-owned. */
+:root:root {
+	--surface-hover: var(--launcher-hover-overlay);
+	--surface-active: color-mix(in srgb, var(--accent) 24%, transparent);
+	--surface-selected: color-mix(in srgb, var(--accent) 14%, transparent);
+	--border-hover: var(--launcher-hover-border);
+}
+
+.library-nav {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 9px;
+	min-width: 0;
+	min-height: 36px;
+	padding: 5px 9px;
+	border: 1px solid color-mix(in srgb, var(--text-secondary) 38%, var(--border));
+	border-radius: var(--launcher-control-radius);
+	background: var(--launcher-surface);
+	color: var(--text-secondary);
+	font: inherit;
+	font-size: .83rem;
+	font-weight: 750;
+	cursor: pointer;
+	transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.library-nav[aria-current="page"] {
+	background: var(--launcher-selected);
+	color: var(--text-primary);
+	border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+}
+
+.library-nav:is(:hover, :focus-visible) {
+	background: var(--launcher-item-hover);
+	border-color: var(--launcher-hover-border);
+	color: var(--text-primary);
+}
+
+.launcher-create:not(:disabled):is(:hover, :focus-visible) {
+	background: var(--accent-hover);
+	box-shadow: 0 0 0 2px var(--launcher-hover-border);
+}
+
+.library-nav:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: -2px;
+}
+
+.library-nav span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.account-switch-chevron {
+	color: var(--accent);
+	flex-shrink: 0;
+	transform: rotate(var(--account-chevron-rotation, 0deg));
+	transition: transform .18s ease-in-out;
+}

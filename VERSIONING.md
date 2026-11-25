@@ -1,0 +1,109 @@
+# Versionado de moonlauncher
+
+moonlauncher usa un sistema de versiones secuencial simple:
+
+- **Major** — número entero que incrementa con cada release (27, 28, 29...)
+- **Patch** — revisiones o hotfixes sobre un mismo major
+
+## Motivación del cambio
+
+El sistema anterior (`AAMMP`, ej. `2606c`) era básicamente copiar el
+formato de snapshots de Mojang, mezclando fecha y parche en un código
+críptico. Requería tabla de mapeo, el semver interno se veía raro
+(major `26`), y nadie lo entendía de un vistazo. El nuevo sistema es
+secuencial simple: cada release es solo un número que sube. Se explica
+solo.
+
+## Formato de versión
+
+| Release | User-facing | Semver (interno) |
+|---------|-------------|------------------|
+| Major   | `27`        | `27.0.0`         |
+| Rev 1   | `27 rev 1`  | `27.0.1`         |
+| Rev 2   | `27 rev 2`  | `27.0.2`         |
+| Major   | `28`        | `28.0.0`         |
+
+- Si `PATCH == 0` → se muestra solo el major (`"27"`)
+- Si `PATCH > 0` → se muestra major + `" rev "` + patch (`"27 rev 1"`)
+
+## Nota técnica
+
+Internamente el proyecto usa semver (`MAJOR.MINOR.PATCH`) requerido por Tauri
+para el sistema de actualizaciones automáticas. El mapeo es directo:
+
+| User-facing | Semver  |
+|-------------|---------|
+| `27`        | `27.0.0`|
+| `27 rev 1`  | `27.0.1`|
+| `28`        | `28.0.0`|
+
+> **Nota:** El `MINOR` en semver siempre es `0`. Solo se usa `MAJOR` y `PATCH`.
+
+## Proceso de publicación
+
+moonlauncher publica las versiones en dos pasos para evitar distribuir
+binarios no revisados.
+
+### 1. Crear un tag
+
+Antes de crear el tag, sincronizá la versión en `package.json`,
+`src-tauri/Cargo.toml` y `src-tauri/tauri.conf.json` (incluido el título de la
+ventana). Actualizá también el `Cargo.lock` de la raíz y verificá desde la raíz:
+
+```bash
+cargo update --workspace --offline
+cargo clippy --workspace --locked -- -D warnings
+```
+
+Si faltan dependencias en la caché local, ejecutá el primer comando sin
+`--offline`. Incluí el `Cargo.lock` actualizado en el mismo commit del cambio
+de versión, antes de etiquetarlo.
+
+Las tres versiones deben coincidir **incluido el sufijo de prerelease**. Por
+ejemplo, una beta `36.0.0-beta.1` también debe figurar así en `tauri.conf.json`:
+si allí dice `36.0.0`, el updater la interpreta como una versión final y rechaza
+las betas posteriores del mismo major. CI y las builds de release verifican esta
+coincidencia; las builds por tag también comprueban que el tag sea `v` seguido de
+la versión empaquetada.
+
+```bash
+bun test --conditions=browser ./tests/frontend/ui/versionMetadata.test.mjs
+```
+
+CI, prerelease y release usan `--locked`: incluso un cambio de versión del
+launcher requiere sincronizar el lockfile. La caché Rust acelera las descargas
+y la compilación, pero no corrige un lockfile desactualizado; borrarla no
+resuelve ese error.
+
+Los tags siguen el formato interno de semver:
+
+```bash
+git tag v31.0.0
+git push origin v31.0.0
+```
+
+Para prereleases:
+
+```bash
+git tag v31.0.0-alpha.1
+git push origin v31.0.0-alpha.1
+```
+
+### 2. Esperar el draft
+
+Al pushear el tag, el workflow `Build Release Draft` (o `Build Prerelease Draft`)
+compila la app en Linux, Windows y macOS, y sube los binarios a un **Release
+Draft** de GitHub con notas autogeneradas. El release **no es público** todavía.
+
+### 3. Revisar y publicar
+
+Una vez que el draft esté completo, ejecutá el workflow manual
+`Publish Release` desde GitHub Actions indicando el tag. Solo ahí el release se
+vuelve público y el sistema de actualizaciones de Tauri lo distribuye a los
+usuarios.
+
+### Builds de desarrollo
+
+Cada push a la rama `develop` dispara una build de prerelease que deja los
+binarios como artefactos de la ejecución de GitHub Actions. No crea un release
+público ni una nueva versión.

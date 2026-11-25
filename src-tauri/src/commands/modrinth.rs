@@ -1,0 +1,425 @@
+use std::collections::HashMap;
+
+use aqua::{DownloadItemSpec, DownloadManager, GenericBatch};
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
+
+use crate::commands::instance::mods::{PerFileCacheEntry, repo_path};
+use crate::core::PathManager;
+use crate::core::errors::{DownloadError, FsError, InstanceError};
+use crate::core::validate_filename;
+use crate::services::InstanceManager;
+use crate::services::compute_file_sha1;
+use crate::services::download_queue::run_tracked_download;
+
+/// Traduce errores de descarga; una cancelación del usuario no es un fallo.
+fn map_download_error(error: aqua::AquaError) -> String {
+    match error {
+        aqua::AquaError::Cancelled => "Download cancelled".to_string(),
+        other => DownloadError::Request(other.to_string()).to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModDownloadInfo {
+    #[serde(default)]
+    pub source: Option<String>,
+    pub url: String,
+    pub filename: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub sha1: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn download_source(download: &ModDownloadInfo) -> crate::services::ModSource {
+    use crate::services::ModSource;
+    let Some(project_id) = &download.project_id else {
+        return ModSource::Local;
+    };
+    let version_id = download.version_id.clone().unwrap_or_default();
+    if download.source.as_deref() == Some("curseforge") {
+        ModSource::CurseForge {
+            project_id: project_id.clone(),
+            file_id: version_id,
+        }
+    } else {
+        ModSource::Modrinth {
+            project_id: project_id.clone(),
+            version_id,
+            slug: None,
+        }
+    }
+}
+
+// Validate the entire batch before creating directories, preparing Aqua or
+// writing caches. CurseForge market downloads use these same endpoints.
+async fn ensure_downloads_mutable(
+    instance_dir: &std::path::Path,
+    subdir: &str,
+    downloads: &[ModDownloadInfo],
+) -> Result<(), String> {
+    let paths = downloads
+        .iter()
+        .map(|download| {
+            validate_filename(&download.filename)?;
+            Ok(format!("{}/{}", subdir, download.filename))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    crate::services::modpack::ensure_paths_mutable(instance_dir, &paths).await
+}
+
+#[tauri::command]
+pub async fn download_mods(instance_id: String, mods: Vec<ModDownloadInfo>) -> Result<(), String> {
+    // Aqua's workers outlive their awaiting caller; keep the instance lease alive too.
+    tokio::spawn(download_mods_inner(instance_id, mods))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+async fn download_mods_inner(
+    instance_id: String,
+    mods: Vec<ModDownloadInfo>,
+) -> Result<(), String> {
+    let manager = InstanceManager::get();
+    let handle = manager
+        .get_handle(&instance_id)
+        .await
+        .ok_or_else(|| InstanceError::NotFound.to_string())?;
+    let _files_guard = handle.try_lock_files()?;
+    if handle.is_busy() {
+        return Err(InstanceError::Busy.to_string());
+    }
+    let instance_dir = handle.get_instance_dir().await;
+    let mods_dir = instance_dir.join("mods");
+    ensure_downloads_mutable(&instance_dir, "mods", &mods).await?;
+
+    tokio::fs::create_dir_all(&mods_dir).await.map_err(|e| {
+        FsError::CreateDir {
+            path: mods_dir.to_string_lossy().to_string(),
+            source: e,
+        }
+        .to_string()
+    })?;
+
+    let count = mods.len();
+    let items: Vec<DownloadItemSpec> = mods
+        .iter()
+        .map(|m| {
+            let mut spec = DownloadItemSpec::new(m.url.clone(), mods_dir.join(&m.filename), "mod");
+            if !m.headers.is_empty() {
+                spec = spec.with_headers(m.headers.clone());
+            }
+            if let Some(hash) = &m.sha1
+                && !hash.is_empty()
+            {
+                spec = spec.with_hash(hash.clone());
+            }
+            info!(
+                "Queueing mod: {} -> {:?}{}",
+                m.filename,
+                mods_dir.join(&m.filename),
+                m.sha1
+                    .as_ref()
+                    .map(|h| format!(" (sha1: {})", &h[..8.min(h.len())]))
+                    .unwrap_or_default()
+            );
+            spec
+        })
+        .collect();
+
+    let batch = GenericBatch::new(format!("mods-{}", instance_id), items);
+
+    let shared_dir = PathManager::get().get_shared_dir();
+    let dm = DownloadManager::new(shared_dir);
+    let dl_handle = dm
+        .prepare_batch(Box::new(batch))
+        .await
+        .map_err(|e| DownloadError::Request(e.to_string()).to_string())?;
+
+    run_tracked_download(format!("mods-{instance_id}").into(), dl_handle)
+        .await
+        .map_err(map_download_error)?;
+
+    // Post-download: compute SHA1 in parallel and cache metadata in ablage
+    let cache_path = repo_path(&mods_dir);
+    let mut repo = ablage::Repo::open(&cache_path);
+
+    let sha1_futs: Vec<_> = mods
+        .iter()
+        .map(|m| {
+            let file_path = mods_dir.join(&m.filename);
+            tokio::task::spawn_blocking(move || {
+                let sha1 = compute_file_sha1(&file_path).unwrap_or_default();
+                let metadata = crate::services::AddonManager::get_mod_metadata_only(&file_path);
+                (file_path, sha1, metadata)
+            })
+        })
+        .collect();
+
+    let sha1_results: Vec<_> = futures::future::join_all(sha1_futs)
+        .await
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (m, (file_path, sha1, metadata)) in mods.iter().zip(sha1_results.iter()) {
+        if !file_path.exists() || sha1.is_empty() {
+            if sha1.is_empty() {
+                warn!("Could not compute SHA1 for {}", m.filename);
+            }
+            continue;
+        }
+
+        let source = download_source(m);
+
+        let entry = PerFileCacheEntry {
+            sha1: sha1.clone(),
+            metadata: metadata.clone(),
+            source,
+        };
+
+        if let Ok(data) = postcard::to_stdvec(&entry)
+            && let Ok(metadata) = std::fs::metadata(file_path)
+            && let Ok(modified) = metadata.modified()
+        {
+            repo.put(
+                m.filename.clone(),
+                ablage::Entry {
+                    version: 1,
+                    fingerprint: crate::services::file_fingerprint(
+                        &m.filename,
+                        &modified,
+                        metadata.len(),
+                    ),
+                    data,
+                },
+            );
+        }
+    }
+
+    let _ = repo.flush();
+
+    info!("{} mods downloaded and cached in {:?}", count, mods_dir);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn download_resourcepacks(
+    instance_id: String,
+    packs: Vec<ModDownloadInfo>,
+) -> Result<(), String> {
+    tokio::spawn(download_resourcepacks_inner(instance_id, packs))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+async fn download_resourcepacks_inner(
+    instance_id: String,
+    packs: Vec<ModDownloadInfo>,
+) -> Result<(), String> {
+    let manager = InstanceManager::get();
+    let handle = manager
+        .get_handle(&instance_id)
+        .await
+        .ok_or_else(|| InstanceError::NotFound.to_string())?;
+    let _files_guard = handle.try_lock_files()?;
+    if handle.is_busy() {
+        return Err(InstanceError::Busy.to_string());
+    }
+    let instance_dir = handle.get_instance_dir().await;
+    let version = handle.get_version().await;
+    crate::services::pack_dir::migrate_legacy_packs(&instance_dir, &version).await?;
+    let pack_dir = crate::services::pack_dir::physical_pack_dir(&version, "resourcepacks");
+    let rp_dir = instance_dir.join(pack_dir);
+    ensure_downloads_mutable(&instance_dir, pack_dir, &packs).await?;
+
+    tokio::fs::create_dir_all(&rp_dir).await.map_err(|e| {
+        FsError::CreateDir {
+            path: rp_dir.to_string_lossy().to_string(),
+            source: e,
+        }
+        .to_string()
+    })?;
+
+    let count = packs.len();
+    let items: Vec<DownloadItemSpec> = packs
+        .iter()
+        .map(|m| {
+            info!(
+                "Queueing resource pack: {} -> {:?}",
+                m.filename,
+                rp_dir.join(&m.filename)
+            );
+            let mut spec =
+                DownloadItemSpec::new(m.url.clone(), rp_dir.join(&m.filename), "resourcepack");
+            if !m.headers.is_empty() {
+                spec = spec.with_headers(m.headers.clone());
+            }
+            spec
+        })
+        .collect();
+
+    let batch = GenericBatch::new(format!("resourcepacks-{}", instance_id), items);
+
+    let shared_dir = PathManager::get().get_shared_dir();
+    let dm = DownloadManager::new(shared_dir);
+    let handle = dm
+        .prepare_batch(Box::new(batch))
+        .await
+        .map_err(|e| DownloadError::Request(e.to_string()).to_string())?;
+
+    run_tracked_download(format!("resourcepacks-{instance_id}").into(), handle)
+        .await
+        .map_err(map_download_error)?;
+
+    // Cache metadata via ablage, preserving the real download source
+    // (Modrinth or CurseForge) so the catalog can match the installed pack.
+    for m in &packs {
+        if m.project_id.is_some() && m.version_id.is_some() {
+            crate::services::save_pack_cache(
+                &rp_dir,
+                &m.filename,
+                &crate::services::PackCacheEntry {
+                    source: download_source(m),
+                },
+            );
+        }
+    }
+
+    info!(
+        "{} resource packs downloaded successfully in {:?}",
+        count, rp_dir
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn download_shaderpacks(
+    instance_id: String,
+    packs: Vec<ModDownloadInfo>,
+) -> Result<(), String> {
+    tokio::spawn(download_shaderpacks_inner(instance_id, packs))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+async fn download_shaderpacks_inner(
+    instance_id: String,
+    packs: Vec<ModDownloadInfo>,
+) -> Result<(), String> {
+    let manager = InstanceManager::get();
+    let handle = manager
+        .get_handle(&instance_id)
+        .await
+        .ok_or_else(|| InstanceError::NotFound.to_string())?;
+    let _files_guard = handle.try_lock_files()?;
+    if handle.is_busy() {
+        return Err(InstanceError::Busy.to_string());
+    }
+    let instance_dir = handle.get_instance_dir().await;
+    let sp_dir = instance_dir.join("shaderpacks");
+    ensure_downloads_mutable(&instance_dir, "shaderpacks", &packs).await?;
+
+    tokio::fs::create_dir_all(&sp_dir).await.map_err(|e| {
+        FsError::CreateDir {
+            path: sp_dir.to_string_lossy().to_string(),
+            source: e,
+        }
+        .to_string()
+    })?;
+
+    let count = packs.len();
+    let items: Vec<DownloadItemSpec> = packs
+        .iter()
+        .map(|m| {
+            info!(
+                "Queueing shader pack: {} -> {:?}",
+                m.filename,
+                sp_dir.join(&m.filename)
+            );
+            let mut spec =
+                DownloadItemSpec::new(m.url.clone(), sp_dir.join(&m.filename), "shaderpack");
+            if !m.headers.is_empty() {
+                spec = spec.with_headers(m.headers.clone());
+            }
+            spec
+        })
+        .collect();
+
+    let batch = GenericBatch::new(format!("shaderpacks-{}", instance_id), items);
+
+    let shared_dir = PathManager::get().get_shared_dir();
+    let dm = DownloadManager::new(shared_dir);
+    let handle = dm
+        .prepare_batch(Box::new(batch))
+        .await
+        .map_err(|e| DownloadError::Request(e.to_string()).to_string())?;
+
+    run_tracked_download(format!("shaderpacks-{instance_id}").into(), handle)
+        .await
+        .map_err(map_download_error)?;
+
+    // Cache metadata via ablage, preserving the real download source
+    // (Modrinth or CurseForge) so the catalog can match the installed pack.
+    for m in &packs {
+        if m.project_id.is_some() && m.version_id.is_some() {
+            crate::services::save_pack_cache(
+                &sp_dir,
+                &m.filename,
+                &crate::services::PackCacheEntry {
+                    source: download_source(m),
+                },
+            );
+        }
+    }
+
+    info!(
+        "{} shader packs downloaded successfully in {:?}",
+        count, sp_dir
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn download_mrpack(url: String, version_id: String) -> Result<String, String> {
+    info!("Downloading mrpack from {} (version: {})", url, version_id);
+
+    validate_filename(&version_id).map_err(|e| format!("Invalid version_id: {}", e))?;
+
+    let cache_dir = std::env::temp_dir()
+        .join("moonlauncher")
+        .join("mrpack-cache");
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| format!("Failed to create cache dir: {}", e))?;
+
+    let filename = format!("{}.mrpack", version_id);
+    let dest = cache_dir.join(&filename);
+
+    let item = aqua::DownloadItemSpec::new(url, dest.clone(), "mrpack");
+    let batch = aqua::GenericBatch::new(format!("mrpack-{}", version_id), vec![item]);
+
+    let shared_dir = PathManager::get().get_shared_dir();
+    let dm = aqua::DownloadManager::new(shared_dir);
+    let handle = dm
+        .prepare_batch(Box::new(batch))
+        .await
+        .map_err(|e| format!("Failed to prepare mrpack download: {}", e))?;
+
+    run_tracked_download(format!("mrpack-dl-{version_id}").into(), handle)
+        .await
+        .map_err(|e| format!("Failed to download mrpack: {}", map_download_error(e)))?;
+
+    let path_str = dest.to_string_lossy().to_string();
+    info!("Mrpack downloaded to {}", path_str);
+    Ok(path_str)
+}
+
+#[cfg(test)]
+#[path = "../tests/commands/modrinth.rs"]
+mod tests;

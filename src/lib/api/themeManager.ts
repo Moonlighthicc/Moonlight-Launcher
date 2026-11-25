@@ -1,0 +1,516 @@
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { SvelteMap } from "svelte/reactivity";
+import type { ThemeEntry } from "../types/types";
+import {
+	setThemeBackgroundDimensions,
+	setThemeDiagnostics,
+} from "../state/themeDiagnostics.svelte";
+
+const builtinThemes: ThemeEntry[] = [
+	{
+		id: "dark",
+		name: "Dark",
+		author: "MoonlightLauncher",
+		version: "1.1",
+		type: "builtin",
+		preview: { bg: "#0c0c0c", accent: "#33b1ff", text: "#f0f0f2" },
+	},
+	{
+		id: "light",
+		name: "Light",
+		author: "MoonlightLauncher",
+		version: "1.1",
+		type: "builtin",
+		preview: { bg: "#f5f5f5", accent: "#2563eb", text: "#1a1a1a" },
+	},
+];
+
+export interface ThemeFontFace {
+	family: string;
+	src: string;
+	format?: string | null;
+	weight?: string | null;
+	style?: string | null;
+}
+
+export interface ThemeValidationReport {
+	id: string;
+	name: string | null;
+	format: string;
+	errors: string[];
+	warnings: string[];
+}
+
+export interface ThemeResponse {
+	name: string;
+	author: string;
+	version: string;
+	type: string;
+	variables: Record<string, string>;
+	bg_image?: string | null;
+	bg_image_blur?: number | null;
+	bg_image_opacity?: number | null;
+	fonts: ThemeFontFace[];
+	icons: Record<string, string>;
+	inject_css?: string | null;
+	format?: number;
+	api_version?: string | null;
+	bg_image_size?: string | null;
+	bg_image_position?: string | null;
+	bg_image_brightness?: number | null;
+	inject_layer?: string | null;
+	layout_css?: string | null;
+}
+
+const THEME_VARS_ID = "moon-theme-vars";
+const CUSTOM_CSS_ID = "cubic-theme-css";
+const CUSTOM_FONTS_ID = "cubic-theme-fonts";
+const LAYOUT_CSS_ID = "cubic-theme-layout";
+
+let currentImage: HTMLImageElement | null = null;
+let currentGeneration = 0;
+let currentBlobUrl: string | null = null;
+const addedFonts: Set<globalThis.FontFace> = new Set();
+let appliedThemeId: string | null = null;
+let requestGeneration = 0;
+let pendingTheme: {
+	id: string;
+	promise: Promise<void>;
+	controller: AbortController;
+} | null = null;
+
+// Cache in-memory of the last successfully read theme per id. This avoids
+// re-reading from Rust when opening auxiliary windows (logs, auth, etc.) and
+// reduces duplicate work when the same theme is requested again.
+// LRU with a tiny cap keeps memory bounded even if the user cycles through
+// many themes.
+const MAX_CACHED_THEMES = 3;
+const themeCache = new Map<string, ThemeResponse>();
+
+function getCachedTheme(themeId: string): ThemeResponse | undefined {
+	const hit = themeCache.get(themeId);
+	if (hit) {
+		// Move to most-recently-used position.
+		themeCache.delete(themeId);
+		themeCache.set(themeId, hit);
+	}
+	return hit;
+}
+
+function setCachedTheme(themeId: string, theme: ThemeResponse): void {
+	if (themeCache.has(themeId)) {
+		themeCache.delete(themeId);
+	} else if (themeCache.size >= MAX_CACHED_THEMES) {
+		const first = themeCache.keys().next();
+		if (!first.done) themeCache.delete(first.value);
+	}
+	themeCache.set(themeId, theme);
+}
+
+// Defensive caps for themes that declare an abusive number of icons/fonts.
+// The resources are not rejected; only the first N are eagerly loaded, and
+// the rest are available lazily if the component requests them.
+const MAX_PRELOAD_ICONS = 100;
+const MAX_LOADED_FONTS = 20;
+
+export const themeIcons = new SvelteMap<string, string>();
+export const themeIconDefinitions = new SvelteMap<string, string>();
+// Memoization must not mutate reactive state from Icon.svelte's $derived.
+// The reactive definitions still notify consumers when the theme changes.
+const lazyThemeIcons = new Map<string, string>();
+
+function isAbortError(err: unknown): boolean {
+	return err instanceof Error && err.name === "AbortError";
+}
+
+export function invalidateThemeCache(themeId?: string): void {
+	if (themeId) {
+		themeCache.delete(themeId);
+	} else {
+		themeCache.clear();
+	}
+}
+
+export async function listThemes(): Promise<ThemeEntry[]> {
+	let userThemes: ThemeEntry[] = [];
+	try {
+		userThemes = await invoke<ThemeEntry[]>("list_themes");
+	} catch (e) {
+		console.error("Error listing user themes:", e);
+	}
+	const prefixed = userThemes.map((t: ThemeEntry) => ({
+		...t,
+		id: `user:${t.id}`,
+	}));
+	return [...builtinThemes, ...prefixed];
+}
+
+export async function validateTheme(
+	id: string,
+): Promise<ThemeValidationReport> {
+	return invoke<ThemeValidationReport>("validate_theme", { id });
+}
+
+export const THEME_EXTENSION = "moontheme";
+
+export async function importMoonTheme(path: string): Promise<ThemeEntry> {
+	const theme = await invoke<ThemeEntry>("import_moon_theme", { path });
+	invalidateThemeCache(`user:${theme.id}`);
+	return theme;
+}
+
+export async function removeTheme(id: string): Promise<void> {
+	return invoke("remove_theme", { id });
+}
+
+export async function exportTheme(id: string, dest: string): Promise<string> {
+	return invoke<string>("export_theme", { id, dest });
+}
+
+function releaseImage(img: HTMLImageElement | null) {
+	if (!img) return;
+	img.onload = null;
+	img.onerror = null;
+	img.src = "";
+	img.removeAttribute("src");
+}
+
+function buildThemeCSS(theme: ThemeResponse): string {
+	let css = ":root {\n";
+	for (const [key, value] of Object.entries(theme.variables)) {
+		css += `  ${key}: ${value};\n`;
+	}
+	if (
+		theme.bg_image_blur != null &&
+		!("--bg-image-blur" in theme.variables)
+	) {
+		css += `  --bg-image-blur: ${theme.bg_image_blur}px;\n`;
+	}
+	if (
+		theme.bg_image_opacity != null &&
+		!("--bg-image-opacity" in theme.variables)
+	) {
+		css += `  --bg-image-opacity: ${theme.bg_image_opacity};\n`;
+	}
+	if (
+		theme.bg_image_size != null &&
+		!("--bg-image-size" in theme.variables)
+	) {
+		css += `  --bg-image-size: ${theme.bg_image_size};\n`;
+	}
+	if (
+		theme.bg_image_position != null &&
+		!("--bg-image-position" in theme.variables)
+	) {
+		css += `  --bg-image-position: ${theme.bg_image_position};\n`;
+	}
+	if (
+		theme.bg_image_brightness != null &&
+		!("--bg-image-brightness" in theme.variables)
+	) {
+		css += `  --bg-image-brightness: ${theme.bg_image_brightness};\n`;
+	}
+	css += "}\n";
+	return css;
+}
+
+function buildInjectCss(theme: ThemeResponse): string | null {
+	if (!theme.inject_css) return null;
+	if (theme.inject_layer === "theme") {
+		return `@layer cubic.theme {\n${theme.inject_css}\n}\n`;
+	}
+	return theme.inject_css;
+}
+
+/**
+ * Aplica el layout pack del tema. Va sin capa y después del CSS del tema para
+ * que pueda reestructurar el shell mediante los atributos data-part estables.
+ */
+function applyLayoutCss(css: string | null | undefined) {
+	document.getElementById(LAYOUT_CSS_ID)?.remove();
+	if (!css) return;
+	const style = document.createElement("style");
+	style.id = LAYOUT_CSS_ID;
+	style.textContent = css;
+	document.head.appendChild(style);
+}
+
+function setThemeStyle(css: string) {
+	let el = document.getElementById(THEME_VARS_ID) as HTMLStyleElement | null;
+	if (!el) {
+		el = document.createElement("style");
+		el.id = THEME_VARS_ID;
+		document.head.appendChild(el);
+	}
+	el.textContent = css;
+}
+
+function removeThemeStyle() {
+	const el = document.getElementById(THEME_VARS_ID);
+	if (el) el.remove();
+}
+
+function clearThemeResources() {
+	removeThemeStyle();
+
+	const root = document.documentElement;
+	root.style.removeProperty("--bg-image");
+	root.style.removeProperty("--bg-image-loaded");
+	root.style.removeProperty("--font-loaded");
+
+	releaseImage(currentImage);
+	currentImage = null;
+
+	if (currentBlobUrl) {
+		URL.revokeObjectURL(currentBlobUrl);
+		currentBlobUrl = null;
+	}
+
+	const existingCustomCss = document.getElementById(CUSTOM_CSS_ID);
+	if (existingCustomCss) existingCustomCss.remove();
+
+	const existingLayout = document.getElementById(LAYOUT_CSS_ID);
+	if (existingLayout) existingLayout.remove();
+
+	const existingCustom = document.getElementById(CUSTOM_FONTS_ID);
+	if (existingCustom) existingCustom.remove();
+
+	for (const face of addedFonts) {
+		document.fonts.delete(face);
+	}
+	addedFonts.clear();
+
+	themeIcons.clear();
+	themeIconDefinitions.clear();
+	lazyThemeIcons.clear();
+}
+
+let currentRevision = "";
+
+export function getThemeIcon(name: string): string | null {
+	const cached = themeIcons.get(name);
+	if (cached) return cached;
+	const definition = themeIconDefinitions.get(name);
+	if (!definition) return null;
+	const lazyCached = lazyThemeIcons.get(name);
+	if (lazyCached) return lazyCached;
+	const url = appliedThemeId?.startsWith("user:")
+		? `${convertFileSrc(definition)}?theme-revision=${currentRevision}`
+		: definition;
+	lazyThemeIcons.set(name, url);
+	return url;
+}
+
+export function applyTheme(
+	themeId: string,
+	opts?: { force?: boolean },
+): Promise<void> {
+	if (!opts?.force && pendingTheme?.id === themeId) {
+		return pendingTheme.promise;
+	}
+
+	const request = ++requestGeneration;
+	pendingTheme?.controller.abort();
+	if (!opts?.force && themeId === appliedThemeId) {
+		pendingTheme = null;
+		return Promise.resolve();
+	}
+
+	if (opts?.force) {
+		invalidateThemeCache(themeId);
+	}
+
+	const controller = new AbortController();
+	const promise = (async () => {
+		let theme: ThemeResponse | null = getCachedTheme(themeId) ?? null;
+
+		if (!theme) {
+			if (builtinThemes.find((t) => t.id === themeId)) {
+				try {
+					const res = await fetch(
+						`/themes/${themeId}/${themeId}.json`,
+						{
+							signal: controller.signal,
+						},
+					);
+					if (!res.ok) {
+						throw new Error(`Theme request failed: ${res.status}`);
+					}
+					theme = await res.json();
+				} catch (err) {
+					if (isAbortError(err)) return;
+					throw err;
+				}
+			} else if (themeId.startsWith("user:")) {
+				const id = themeId.slice(5);
+				theme = await invoke<ThemeResponse>("get_user_theme", { id });
+			}
+		}
+
+		if (!theme) return;
+		if (request !== requestGeneration) return;
+
+		// Cache successful reads so auxiliary windows (logs, auth, etc.) avoid
+		// redundant Rust round-trips.
+		setCachedTheme(themeId, theme);
+
+		const css = buildThemeCSS(theme);
+		// A file can change without changing its path, including while inactive.
+		const revision = `${Date.now()}-${request}`;
+		currentRevision = revision;
+		const assetUrl = (path: string) =>
+			themeId.startsWith("user:")
+				? `${convertFileSrc(path)}?theme-revision=${revision}`
+				: path;
+		const iconEntries = Object.entries(theme.icons ?? {}).filter(
+			([, path]) => path,
+		);
+		if (iconEntries.length > MAX_PRELOAD_ICONS) {
+			console.warn(
+				`Theme "${themeId}" declares ${iconEntries.length} icons; only the first ${MAX_PRELOAD_ICONS} are preloaded.`,
+			);
+		}
+		const icons = iconEntries
+			.slice(0, MAX_PRELOAD_ICONS)
+			.map(([key, path]) => [key, assetUrl(path)] as const);
+		const bgImg = theme.bg_image;
+		const imgUrl = bgImg && assetUrl(bgImg);
+
+		// Pending reads do not own the displayed resources until they commit.
+		const gen = ++currentGeneration;
+		clearThemeResources();
+		setThemeStyle(css);
+		setThemeDiagnostics(themeId, theme);
+
+		for (const [key, url] of icons) {
+			themeIcons.set(key, url);
+		}
+		// Keep definitions for the rest so individual components can resolve them
+		// lazily without re-reading the theme manifest.
+		for (const [key, path] of iconEntries) {
+			themeIconDefinitions.set(key, path);
+		}
+
+		const root = document.documentElement;
+
+		if (imgUrl) {
+			root.style.setProperty("--bg-image-loaded", "0");
+
+			const img = new Image();
+			currentImage = img;
+			img.onload = () => {
+				img.onload = null;
+				img.onerror = null;
+				if (gen !== currentGeneration || currentImage !== img) return;
+				currentImage = null;
+				root.style.setProperty("--bg-image", `url("${imgUrl}")`);
+				root.style.setProperty("--bg-image-loaded", "1");
+				setThemeBackgroundDimensions(
+					themeId,
+					img.naturalWidth,
+					img.naturalHeight,
+				);
+			};
+			img.onerror = () => {
+				img.onload = null;
+				img.onerror = null;
+				if (gen !== currentGeneration || currentImage !== img) return;
+				currentImage = null;
+				root.style.setProperty("--bg-image", "none");
+			};
+			img.src = imgUrl;
+		}
+
+		if (theme.fonts && theme.fonts.length > 0) {
+			root.style.setProperty("--font-loaded", "0");
+
+			const loaded: Promise<void>[] = [];
+			const fontsToLoad = theme.fonts.slice(0, MAX_LOADED_FONTS);
+
+			if (theme.fonts.length > MAX_LOADED_FONTS) {
+				console.warn(
+					`Theme "${themeId}" declares ${theme.fonts.length} fonts; only the first ${MAX_LOADED_FONTS} will be loaded.`,
+				);
+			}
+
+			for (const font of fontsToLoad) {
+				try {
+					const fontSrc = assetUrl(font.src);
+
+					const descriptors: FontFaceDescriptors = {};
+					if (font.weight) descriptors.weight = font.weight;
+					if (font.style) descriptors.style = font.style;
+
+					const face = new FontFace(
+						font.family,
+						`url(${fontSrc})`,
+						descriptors,
+					);
+					face.display = "swap";
+
+					loaded.push(
+						face
+							.load()
+							.then(() => {
+								if (gen !== currentGeneration) return;
+								document.fonts.add(face);
+								addedFonts.add(face);
+							})
+							.catch((err) => {
+								console.warn(
+									`Font "${font.family}" failed to load:`,
+									err,
+									`src: ${fontSrc}`,
+								);
+							}),
+					);
+				} catch (err) {
+					console.warn(
+						`Font "${font.family}" could not be created:`,
+						err,
+					);
+				}
+			}
+
+			Promise.allSettled(loaded).then(() => {
+				if (gen !== currentGeneration) return;
+				document.documentElement.style.setProperty(
+					"--font-loaded",
+					"1",
+				);
+			});
+		}
+
+		const injectCss = buildInjectCss(theme);
+		if (injectCss) {
+			const blob = new Blob([injectCss], { type: "text/css" });
+			const url = URL.createObjectURL(blob);
+			currentBlobUrl = url;
+			const link = document.createElement("link");
+			link.rel = "stylesheet";
+			link.href = url;
+			link.id = CUSTOM_CSS_ID;
+			document.head.appendChild(link);
+		}
+
+		// El layout pack va al final: es el único CSS pensado para reestructurar.
+		applyLayoutCss(theme.layout_css);
+
+		document.documentElement.dataset.theme = themeId;
+		appliedThemeId = themeId;
+	})()
+		.catch((err) => {
+			if (isAbortError(err)) return;
+			if (request === requestGeneration) {
+				// Something actually went wrong loading this theme; drop any stale
+				// cached copy so the next attempt reads fresh data.
+				invalidateThemeCache(themeId);
+				console.error("Error loading theme:", err);
+			}
+		})
+		.finally(() => {
+			if (request === requestGeneration) pendingTheme = null;
+		});
+	pendingTheme = { id: themeId, promise, controller };
+	return promise;
+}

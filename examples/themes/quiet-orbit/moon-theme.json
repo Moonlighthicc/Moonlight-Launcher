@@ -1,0 +1,25 @@
+{
+	"format": "moonlauncher",
+	"format_version": 1,
+	"id": "quiet-orbit",
+	"name": "Quiet Orbit",
+	"author": "MoonLauncher",
+	"version": "1.0.0",
+	"tokens": {
+		"--bg-main": "#111318",
+		"--bg-sidebar": "#171a21",
+		"--bg-card": "#1c2029",
+		"--bg-input": "#14171e",
+		"--text-primary": "#eef0f6",
+		"--text-secondary": "#b0b9c9",
+		"--text-muted": "#919bb0",
+		"--accent": "#afbcf4",
+		"--accent-rgb": "175, 188, 244",
+		"--accent-hover": "#c2ccfa",
+		"--accent-text": "#171b29",
+		"--border-color": "#353c4c",
+		"--border-radius-sm": "8px",
+		"--border-radius": "12px",
+		"--border-radius-lg": "16px"
+	}
+}

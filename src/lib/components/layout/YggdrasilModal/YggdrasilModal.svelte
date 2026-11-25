@@ -1,0 +1,250 @@
+<script lang="ts">
+	import { t } from "$lib/i18n";
+	import {
+		getYggdrasilServerInfo,
+		yggdrasilAuthenticate,
+	} from "$lib/api/cubicApi";
+	import { saveSettings } from "$lib/api/launcherService";
+	import type { YggdrasilServerInfo } from "$lib/types/types";
+	import { onDestroy } from "svelte";
+	import { launcherStore } from "$lib/state/state.svelte";
+	import ModalBase from "../ModalBase.svelte";
+	import AuthLoading from "../auth/AuthLoading.svelte";
+	import AuthError from "../auth/AuthError.svelte";
+	import AuthSuccess from "../auth/AuthSuccess.svelte";
+	import ServerStep from "./ServerStep.svelte";
+	import LoginStep from "./LoginStep.svelte";
+
+	let {
+		open = $bindable(false),
+		initialServerUrl = "",
+		title,
+		serverInstruction,
+		signupUrl,
+		usernameLabel,
+		passwordLabel,
+		autoConnect = false,
+		onsuccess,
+		onclosed,
+		reauthUsername,
+	}: {
+		open: boolean;
+		initialServerUrl?: string;
+		title?: string;
+		serverInstruction?: string;
+		signupUrl?: string;
+		usernameLabel?: string;
+		passwordLabel?: string;
+		autoConnect?: boolean;
+		onsuccess?: () => void;
+		onclosed: () => void;
+		reauthUsername?: string;
+	} = $props();
+
+	type Step = "server" | "login" | "loading" | "success" | "error";
+
+	let step = $state<Step>("server");
+	let serverUrl = $state("");
+	let username = $state("");
+	let password = $state("");
+	let serverInfo = $state<YggdrasilServerInfo | null>(null);
+	let error = $state<string | null>(null);
+	let closeTimer: ReturnType<typeof setTimeout> | undefined;
+	let attempt = 0;
+
+	onDestroy(() => {
+		clearTimeout(closeTimer);
+		attempt++;
+	});
+
+	$effect(() => {
+		if (open) {
+			clearTimeout(closeTimer);
+			serverUrl = initialServerUrl;
+			username = "";
+			password = "";
+			serverInfo = null;
+			error = null;
+			if (autoConnect && initialServerUrl.trim()) {
+				step = "loading";
+				queueMicrotask(() => {
+					void handleConnectServer();
+				});
+			} else {
+				step = "server";
+			}
+		} else {
+			attempt++;
+			clearTimeout(closeTimer);
+		}
+	});
+
+	async function handleConnectServer() {
+		if (!open || !serverUrl.trim()) return;
+		const currentAttempt = ++attempt;
+		step = "loading";
+		error = null;
+		try {
+			const info = await getYggdrasilServerInfo(serverUrl.trim());
+			if (currentAttempt !== attempt || !open) return;
+			serverInfo = info;
+			step = "login";
+		} catch (e: unknown) {
+			if (currentAttempt !== attempt || !open) return;
+			error = String(e);
+			step = "error";
+		}
+	}
+
+	async function handleLogin() {
+		if (!open || !username.trim() || !password) return;
+		const currentAttempt = ++attempt;
+		step = "loading";
+		error = null;
+		try {
+			const user = await yggdrasilAuthenticate(
+				serverUrl.trim(),
+				username.trim(),
+				password,
+			);
+			if (currentAttempt !== attempt || !open) return;
+
+			const idx = launcherStore.settings.user.findIndex(
+				(u) => u.uuid === user.uuid,
+			);
+			if (idx >= 0) {
+				launcherStore.settings.user[idx] = user;
+				launcherStore.settings.active_user_idx = idx;
+			} else {
+				launcherStore.settings.user.push(user);
+				launcherStore.settings.active_user_idx =
+					launcherStore.settings.user.length - 1;
+			}
+			await saveSettings();
+			if (currentAttempt !== attempt || !open) return;
+			step = "success";
+			onsuccess?.();
+			closeTimer = setTimeout(() => {
+				open = false;
+			}, 2000);
+		} catch (e: unknown) {
+			if (currentAttempt !== attempt || !open) return;
+			error = String(e);
+			step = "error";
+		}
+	}
+</script>
+
+<ModalBase bind:open title={title ?? t("userMenu.yggdrasilModal.title")} focusOnOpen {onclosed}>
+	<div class="ygg-container">
+		{#if reauthUsername}
+			<p class="reauth-message">
+				{t("userMenu.authModal.sessionExpired", {
+					username: reauthUsername,
+				})}
+			</p>
+		{/if}
+		<div class="ygg-logo-wrapper">
+			<svg
+				class="ygg-logo"
+				viewBox="0 0 24 24"
+				fill="none"
+				stroke="currentColor"
+				stroke-width="1.5"
+				stroke-linecap="round"
+				stroke-linejoin="round"
+			>
+				<path d="M12 2L2 7l10 5 10-5-10-5z" />
+				<path d="M2 17l10 5 10-5" />
+				<path d="M2 12l10 5 10-5" />
+			</svg>
+		</div>
+
+		{#if step === "loading"}
+			<AuthLoading
+				title={t("userMenu.yggdrasilModal.loading")}
+				subtitle={serverInfo?.server_name}
+			/>
+		{:else if step === "error"}
+			<AuthError
+				title={t("userMenu.yggdrasilModal.errorTitle")}
+				message={error ?? t("userMenu.yggdrasilModal.errorUnknown")}
+				onRetry={() => {
+					step = "server";
+					error = null;
+				}}
+			/>
+		{:else if step === "success"}
+			<AuthSuccess
+				title={t("userMenu.yggdrasilModal.successTitle")}
+				subtitle={t("userMenu.yggdrasilModal.successSubtitle")}
+			/>
+		{:else if step === "server"}
+			<ServerStep
+				bind:serverUrl
+				onconnect={handleConnectServer}
+				instruction={serverInstruction}
+			/>
+		{:else if step === "login"}
+			<LoginStep
+				{serverInfo}
+				bind:username
+				bind:password
+				{signupUrl}
+				{usernameLabel}
+				{passwordLabel}
+				onback={() => {
+					step = "server";
+					serverInfo = null;
+				}}
+				onlogin={handleLogin}
+			/>
+		{/if}
+	</div>
+</ModalBase>
+
+<style>
+	.reauth-message {
+		margin: 0 0 1rem;
+		color: var(--text-secondary);
+	}
+	.ygg-container {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		text-align: center;
+		padding: 0;
+		width: 100%;
+		color: var(--text-primary);
+	}
+
+	.ygg-logo-wrapper {
+		margin-bottom: 1.5rem;
+		padding: 1rem;
+		background: var(--bg-card);
+		border-radius: var(--border-radius-sm);
+		border: 1px solid var(--border-color);
+		box-shadow:
+			var(--shadow-sm),
+			inset 0 1px 0 var(--surface-selected);
+	}
+
+	.ygg-logo {
+		width: 48px;
+		height: 48px;
+		display: block;
+		color: var(--accent);
+	}
+
+
+	@media (max-height: 700px) {
+		.ygg-logo-wrapper {
+			margin-bottom: 0.75rem;
+			padding: 0.5rem;
+		}
+		.ygg-logo {
+			width: 32px;
+			height: 32px;
+		}
+	}
+</style>

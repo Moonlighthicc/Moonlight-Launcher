@@ -1,0 +1,856 @@
+<script lang="ts">
+	import ToggleSwitch from "$lib/components/ui/ToggleSwitch.svelte";
+	import { onMount, onDestroy } from "svelte";
+	import { invoke } from "@tauri-apps/api/core";
+	import {
+		launcherStore,
+		jreVendorFor,
+		setJreVendor,
+	} from "$lib/state/state.svelte";
+	import {
+		saveSettings,
+		scheduleSettingsSave,
+		flushSettingsSaves,
+		onAppEvent,
+	} from "$lib/api/launcherService";
+	import { openUrl } from "$lib/api/cubicApi";
+	import { t } from "$lib/i18n";
+	import LanguageSelect from "$lib/components/layout/LanguageSelect.svelte";
+	import Select from "$lib/components/layout/Select.svelte";
+	import { listThemes } from "$lib/api/themeManager";
+	import ThemeSelector from "./ThemeSelector.svelte";
+	import AppearanceSettings from "./AppearanceSettings.svelte";
+	import Icon from "$lib/icons/Icon.svelte";
+	import {
+		getJreVersions,
+		installJre,
+		uninstallJre,
+		getAvailableJreVendors,
+	} from "$lib/api/cubicApi";
+	import type { JreStatus, ThemeEntry } from "$lib/types/types";
+	import AuthorshipSection from "./AuthorshipSection.svelte";
+	import CollapsibleSection from "./CollapsibleSection.svelte";
+	import JreCard from "./JreCard.svelte";
+	import EnvVarEditor from "./EnvVarEditor.svelte";
+	import NotificationSettings from "./NotificationSettings.svelte";
+	import InterfaceSettings from "./InterfaceSettings.svelte";
+	import StorageSection from "./StorageSection.svelte";
+	import OptionsProfilesSection from "./OptionsProfilesSection.svelte";
+	import PerformanceSettings from "./PerformanceSettings.svelte";
+	import MinecraftPerformanceSettings from "./MinecraftPerformanceSettings.svelte";
+	import "./controls.css";
+
+	interface Props {
+		onclose?: () => void;
+	}
+
+	let { onclose }: Props = $props();
+
+	let saving = $state(false);
+	let savingTimer: ReturnType<typeof setTimeout> | undefined;
+	let saveRequest = 0;
+	let destroyed = false;
+
+	onDestroy(() => {
+		destroyed = true;
+		clearTimeout(savingTimer);
+		void flushSettingsSaves();
+	});
+	let currentTab = $state("launcher");
+
+	const JRE_VERSIONS = [8, 17, 21, 25];
+	/** Proveedores conocidos; se usan mientras no llega la lista del backend. */
+	const DEFAULT_JRE_VENDORS = ["zulu", "temurin", "liberica", "graalvm"];
+	let jreStatuses = $state<Record<number, JreStatus>>({});
+	let jreActionStates = $state<Record<number, string | undefined>>({});
+	let jreVendors = $state<Record<number, string[]>>({});
+	let jreVendorsLoaded = false;
+
+	async function refreshJreStatus() {
+		const statuses = await getJreVersions();
+		const map: Record<number, JreStatus> = {};
+		for (const s of statuses) {
+			map[s.version] = s;
+		}
+		jreStatuses = map;
+	}
+
+	async function refreshJreVendors() {
+		if (jreVendorsLoaded) return;
+		jreVendorsLoaded = true;
+
+		const entries = await Promise.all(
+			JRE_VERSIONS.map(async (version) => {
+				const available = await getAvailableJreVendors(version);
+				return [version, available] as const;
+			}),
+		);
+
+		const map: Record<number, string[]> = {};
+		for (const [version, available] of entries) {
+			map[version] =
+				available.length > 0 ? available : DEFAULT_JRE_VENDORS;
+		}
+		jreVendors = map;
+	}
+
+	function selectTab(id: string) {
+		currentTab = id;
+		if (id === "java") void refreshJreVendors();
+	}
+
+	async function handleInstallJre(version: number) {
+		if (jreActionStates[version]) return;
+		jreActionStates[version] = "downloading";
+		try {
+			await installJre(version, jreVendorFor(version));
+		} catch (e) {
+			console.error(`Failed to queue JRE ${version}:`, e);
+			jreActionStates[version] = undefined;
+		}
+	}
+
+	function handleVendorChange(version: number, vendor: string) {
+		setJreVendor(version, vendor);
+		void handleSave();
+	}
+
+	async function handleUninstallJre(version: number) {
+		if (jreActionStates[version]) return;
+		jreActionStates[version] = "uninstalling";
+		try {
+			await uninstallJre(version);
+		} catch (e) {
+			console.error(`Failed to uninstall JRE ${version}:`, e);
+		}
+		jreActionStates[version] = undefined;
+	}
+	async function trackSave(operation: Promise<void>) {
+		const request = ++saveRequest;
+		clearTimeout(savingTimer);
+		saving = true;
+		try {
+			await operation;
+		} finally {
+			if (!destroyed && request === saveRequest) {
+				savingTimer = setTimeout(() => {
+					saving = false;
+				}, 1000);
+			}
+		}
+	}
+
+	function handleSave() {
+		return trackSave(saveSettings());
+	}
+
+	function handlePersonalizationSave() {
+		// Child teardown can commit a slider after the parent's onDestroy.
+		return destroyed ? saveSettings() : trackSave(scheduleSettingsSave());
+	}
+
+	async function autoDetectJava() {
+		try {
+			const paths: Record<string, string> =
+				await invoke("detect_java_paths");
+			for (const v of JRE_VERSIONS) {
+				const p = paths[`jre${v}`];
+				if (p)
+					(
+						launcherStore.settings as unknown as Record<
+							string,
+							string
+						>
+					)[`jre${v}_path`] = p;
+			}
+		} catch (e) {
+			console.error("Failed to detect java paths", e);
+		}
+	}
+
+	let tabs = $derived([
+		{ id: "launcher", label: t("settings.tabs.launcher") },
+		{ id: "minecraft", label: t("settings.tabs.minecraft") },
+		{ id: "personalize", label: t("settings.tabs.personalize") },
+		{ id: "java", label: t("settings.tabs.java") },
+	]);
+
+	let availableThemes = $state<ThemeEntry[]>([]);
+
+	async function loadThemes() {
+		availableThemes = await listThemes();
+	}
+
+	onMount(() => {
+		loadThemes();
+		refreshJreStatus();
+
+		const unsubEnqueue = onAppEvent("DEnqueue", (payload) => {
+			const v = (payload.data as { version: string }).version;
+			const match = v.match(/^jre-(\d+)$/);
+			if (match) {
+				jreActionStates[Number(match[1])] = "downloading";
+			}
+		});
+		const unsubFinish = onAppEvent("DFinish", (payload) => {
+			const v = (payload.data as { version: string }).version;
+			const match = v.match(/^jre-(\d+)$/);
+			if (match) {
+				jreActionStates[Number(match[1])] = undefined;
+				refreshJreStatus();
+			}
+		});
+		const unsubJRE = onAppEvent("JREChanged", () => {
+			refreshJreStatus();
+		});
+
+		return () => {
+			unsubEnqueue();
+			unsubFinish();
+			unsubJRE();
+		};
+	});
+	const currentVersion = __APP_VERSION__;
+
+	const displayVersion = $derived(currentVersion);
+</script>
+
+<div class="qm-root settings-controls">
+	<!-- Header -->
+	<div class="qm-header">
+		<span class="qm-label">{t("settings.title")}</span>
+		<button type="button" class="qm-close-btn" aria-label={t("instanceView.close")} onclick={onclose}>✕</button>
+	</div>
+
+	<!-- Tab Navigation -->
+	<div class="qm-tabs" data-tutorial="settings-tabs">
+		{#each tabs as tab (tab)}
+			<button
+				type="button"
+				class="qm-tab-btn"
+				class:active={currentTab === tab.id}
+				onclick={() => selectTab(tab.id)}
+				data-tutorial="tab-{tab.id}"
+			>
+				<span class="qm-tab-label">{tab.label}</span>
+			</button>
+		{/each}
+	</div>
+
+	<div class="qm-scroll" data-tutorial="settings-scroll">
+		{#if currentTab === "launcher"}
+			<div class="section-group">
+				<CollapsibleSection
+					title={t("settings.launcher.generalTitle")}
+					iconName="nav:sliders"
+					storageKey="section_general"
+				>
+					<LanguageSelect
+						id="language"
+						bind:value={launcherStore.settings.language}
+						onchange={handleSave}
+					/>
+					<div class="qm-field-checkbox">
+						<ToggleSwitch
+							id="hide-on-launch"
+							bind:checked={launcherStore.settings.hide_on_launch}
+							onchange={handleSave}
+						/>
+						<label for="hide-on-launch"
+							>{t("settings.launcher.hideOnLaunch")}</label
+						>
+					</div>
+					<div class="qm-field-checkbox">
+						<ToggleSwitch
+							id="restore-last-instance"
+							bind:checked={launcherStore.settings.restore_last_instance}
+							onchange={handleSave}
+						/>
+						<label for="restore-last-instance">{t("settings.launcher.restoreLastInstance")}</label>
+					</div>
+					<div class="qm-field-checkbox">
+						<ToggleSwitch
+							id="open-console-on-launch"
+							bind:checked={
+								launcherStore.settings.open_console_on_launch
+							}
+							onchange={handleSave}
+						/>
+						<label for="open-console-on-launch"
+							>{t("settings.launcher.openConsoleOnLaunch")}</label
+						>
+					</div>
+				</CollapsibleSection>
+
+				<CollapsibleSection
+					title={t("settings.storage.title")}
+					iconName="instance:database"
+					storageKey="section_storage"
+				>
+					<StorageSection />
+				</CollapsibleSection>
+
+				<CollapsibleSection
+					title={t("settings.launcher.performanceTitle")}
+					iconName="ui:performance"
+					storageKey="section_performance"
+				>
+					<PerformanceSettings onsave={handleSave} />
+				</CollapsibleSection>
+
+				<CollapsibleSection
+					title={t("settings.authorship.title")}
+					iconName="ui:interface"
+					storageKey="section_authorship"
+				>
+					<AuthorshipSection />
+				</CollapsibleSection>
+
+				<CollapsibleSection
+					title={t("settings.about.title")}
+					iconName="ui:interface"
+					storageKey="section_about"
+				>
+					<div class="about-content">
+						<p class="about-desc">
+							{t("settings.about.description")}
+						</p>
+					</div>
+				</CollapsibleSection>
+			</div>
+		{/if}
+
+		{#if currentTab === "personalize"}
+			<div class="section-group">
+				<CollapsibleSection
+					title={t("settings.interface.title")}
+					iconName="ui:interface"
+					storageKey="section_interface"
+				>
+					<ThemeSelector
+						themes={availableThemes}
+						bind:value={launcherStore.settings.theme}
+						onchange={async (id: string) => {
+							try {
+								await invoke("set_theme", { id });
+							} catch (e) {
+								console.error("Error setting theme:", e);
+							}
+						}}
+						onrefresh={loadThemes}
+					/>
+					<InterfaceSettings onsave={handlePersonalizationSave} />
+				</CollapsibleSection>
+				<CollapsibleSection
+					title={t("settings.launcher.appearance.groupSliders")}
+					iconName="nav:pencil"
+					storageKey="section_themes"
+				>
+					<AppearanceSettings onsave={handlePersonalizationSave} />
+				</CollapsibleSection>
+				<CollapsibleSection
+					title={t("settings.personalize.notificationsTitle")}
+					iconName="ui:bell"
+					storageKey="section_notifications"
+				>
+					<NotificationSettings onsave={handlePersonalizationSave} />
+				</CollapsibleSection>
+			</div>
+		{/if}
+
+		{#if currentTab === "minecraft"}
+			<div class="section-group">
+				<CollapsibleSection
+					title={t("settings.minecraft.perfTitle")}
+					iconName="instance:database"
+					storageKey="section_performance"
+				>
+					<MinecraftPerformanceSettings onsave={handleSave} />
+				</CollapsibleSection>
+
+				<CollapsibleSection
+					title={t("settings.minecraft.optionsTitle")}
+					iconName="instance:check-square"
+					storageKey="section_options"
+				>
+					<div class="qm-field-checkbox">
+						<ToggleSwitch
+							id="show-snapshots"
+							bind:checked={launcherStore.settings.show_snapshots}
+							onchange={handleSave}
+						/>
+						<label for="show-snapshots"
+							>{t("settings.minecraft.showSnapshots")}</label
+						>
+					</div>
+					<div class="qm-field-checkbox">
+						<ToggleSwitch
+							id="show-alpha"
+							bind:checked={launcherStore.settings.show_alpha}
+							onchange={handleSave}
+						/>
+						<label for="show-alpha"
+							>{t("settings.minecraft.showAlpha")}</label
+						>
+					</div>
+					<div class="qm-field-checkbox">
+						<ToggleSwitch
+							id="show-unstable-loaders"
+							bind:checked={
+								launcherStore.settings.show_unstable_loaders
+							}
+							onchange={handleSave}
+						/>
+						<label for="show-unstable-loaders"
+							>{t(
+								"settings.minecraft.showUnstableLoaders",
+							)}</label
+						>
+					</div>
+				</CollapsibleSection>
+
+				<CollapsibleSection
+					title={t("settings.minecraft.downloadProviderTitle")}
+					iconName="ui:download"
+					storageKey="section_download_provider"
+				>
+					<Select
+						id="download-provider"
+						compact
+						label={t("settings.minecraft.downloadProviderLabel")}
+						value={launcherStore.settings.download_provider}
+						options={[
+							{
+								value: "official",
+								label: t(
+									"settings.minecraft.downloadProviderOfficial",
+								),
+								subtitle: t(
+									"settings.minecraft.downloadProviderOfficialHint",
+								),
+							},
+							{
+								value: "bmclapi",
+								label: t(
+									"settings.minecraft.downloadProviderBmclapi",
+								),
+								subtitle: t(
+									"settings.minecraft.downloadProviderBmclapiHint",
+								),
+							},
+						]}
+						onchange={(value) => {
+							launcherStore.settings.download_provider = value;
+							handleSave();
+						}}
+					/>
+				</CollapsibleSection>
+
+				<CollapsibleSection
+					title={t("settings.minecraft.consoleTitle")}
+					iconName="instance:terminal"
+					storageKey="section_console"
+				>
+					<div class="qm-field">
+						<label for="console-history-limit"
+							>{t(
+								"settings.minecraft.consoleHistoryLimit",
+							)}</label
+						>
+						<div class="qm-console-limit-row">
+							<input
+								type="number"
+								id="console-history-limit"
+								min="100"
+								max="5000"
+								step="100"
+								class="qm-console-limit-input"
+								bind:value={
+									launcherStore.settings.console_history_limit
+								}
+								onchange={() => {
+									launcherStore.settings.console_history_limit =
+										Math.max(
+											100,
+											Math.min(
+												launcherStore.settings
+													.console_history_limit,
+												5000,
+											),
+										);
+									handleSave();
+								}}
+							/>
+							<span class="qm-console-limit-divider">/</span>
+							<span class="qm-console-limit-max">5000</span>
+						</div>
+					</div>
+					<span class="qm-ram-hint"
+						>{t("settings.minecraft.consoleHistoryHint")}</span
+					>
+					<div class="qm-field-checkbox">
+						<ToggleSwitch
+							id="console-show-level-tags"
+							bind:checked={
+								launcherStore.settings.console_show_level_tags
+							}
+							onchange={handleSave}
+						/>
+						<label for="console-show-level-tags">
+							{t("settings.minecraft.consoleShowLevelTags")}
+							<span class="qm-hint-not-recommended"
+								>{t(
+									"settings.minecraft.consoleShowLevelTagsHint",
+								)}</span
+							>
+						</label>
+					</div>
+				</CollapsibleSection>
+
+				<CollapsibleSection
+					title={t("optionsProfiles.title")}
+					iconName="instance:check-square"
+					storageKey="section_options_profiles"
+				>
+					<OptionsProfilesSection />
+				</CollapsibleSection>
+			</div>
+		{/if}
+
+		{#if currentTab === "java"}
+			<div class="section-group">
+				<CollapsibleSection
+					title={t("settings.java.runtimesTitle")}
+					iconName="instance:terminal"
+					storageKey="section_runtimes"
+				>
+					<JreCard
+						version={8}
+						status={jreStatuses[8] ?? null}
+						managed={launcherStore.settings.jre8_managed}
+						path={launcherStore.settings.jre8_path}
+						pathLabel={t("settings.java.java8Path")}
+						isInstalling={jreActionStates[8] === "downloading"}
+						isUninstalling={jreActionStates[8] === "uninstalling"}
+						vendors={jreVendors[8] ?? DEFAULT_JRE_VENDORS}
+						vendor={launcherStore.settings.jre8_vendor}
+						onToggleManaged={(v) =>
+							(launcherStore.settings.jre8_managed = v)}
+						onInstall={handleInstallJre}
+						onUninstall={handleUninstallJre}
+						onPathChange={(v) =>
+							(launcherStore.settings.jre8_path = v)}
+						onVendorChange={(v) => handleVendorChange(8, v)}
+					/>
+					<JreCard
+						version={17}
+						status={jreStatuses[17] ?? null}
+						managed={launcherStore.settings.jre17_managed}
+						path={launcherStore.settings.jre17_path}
+						pathLabel={t("settings.java.java17Path")}
+						isInstalling={jreActionStates[17] === "downloading"}
+						isUninstalling={jreActionStates[17] === "uninstalling"}
+						vendors={jreVendors[17] ?? DEFAULT_JRE_VENDORS}
+						vendor={launcherStore.settings.jre17_vendor}
+						onToggleManaged={(v) =>
+							(launcherStore.settings.jre17_managed = v)}
+						onInstall={handleInstallJre}
+						onUninstall={handleUninstallJre}
+						onPathChange={(v) =>
+							(launcherStore.settings.jre17_path = v)}
+						onVendorChange={(v) => handleVendorChange(17, v)}
+					/>
+					<JreCard
+						version={21}
+						status={jreStatuses[21] ?? null}
+						managed={launcherStore.settings.jre21_managed}
+						path={launcherStore.settings.jre21_path}
+						pathLabel={t("settings.java.java21Path")}
+						isInstalling={jreActionStates[21] === "downloading"}
+						isUninstalling={jreActionStates[21] === "uninstalling"}
+						vendors={jreVendors[21] ?? DEFAULT_JRE_VENDORS}
+						vendor={launcherStore.settings.jre21_vendor}
+						onToggleManaged={(v) =>
+							(launcherStore.settings.jre21_managed = v)}
+						onInstall={handleInstallJre}
+						onUninstall={handleUninstallJre}
+						onPathChange={(v) =>
+							(launcherStore.settings.jre21_path = v)}
+						onVendorChange={(v) => handleVendorChange(21, v)}
+					/>
+					<JreCard
+						version={25}
+						status={jreStatuses[25] ?? null}
+						managed={launcherStore.settings.jre25_managed}
+						path={launcherStore.settings.jre25_path}
+						pathLabel={t("settings.java.java25Path")}
+						isInstalling={jreActionStates[25] === "downloading"}
+						isUninstalling={jreActionStates[25] === "uninstalling"}
+						vendors={jreVendors[25] ?? DEFAULT_JRE_VENDORS}
+						vendor={launcherStore.settings.jre25_vendor}
+						onToggleManaged={(v) =>
+							(launcherStore.settings.jre25_managed = v)}
+						onInstall={handleInstallJre}
+						onUninstall={handleUninstallJre}
+						onPathChange={(v) =>
+							(launcherStore.settings.jre25_path = v)}
+						onVendorChange={(v) => handleVendorChange(25, v)}
+					/>
+					<div style="margin-top: 12px;">
+						<button
+							type="button"
+							class="detect-btn"
+							onclick={autoDetectJava}
+							>{t("settings.java.detectPathsBtn")}</button
+						>
+					</div>
+					<div class="zulu-credit">
+						{t("settings.java.providersCredit")}
+					</div>
+					<span
+						class="qm-themes-hint"
+						onclick={() =>
+							openUrl("https://www.oracle.com/java/technologies/downloads/")}
+						role="link"
+						tabindex="0"
+						onkeydown={(e) => {
+							if (e.key === "Enter")
+								openUrl(
+									"https://www.oracle.com/java/technologies/downloads/",
+								);
+						}}>{t("settings.launcher.javaSpan")}</span
+					>
+				</CollapsibleSection>
+
+				<CollapsibleSection
+					title={t("settings.advanced")}
+					iconName="nav:settings"
+					storageKey="section_advanced"
+				>
+					<div class="qm-field">
+						<label for="jvm-args"
+							>{t("settings.java.jvmArgs")}</label
+						>
+						<textarea
+							id="jvm-args"
+							bind:value={launcherStore.settings.jvm_args}
+							placeholder="-Xmx2G -Xms1G ..."
+							class="jvm-args-textarea"></textarea>
+					</div>
+					<EnvVarEditor
+						initial={launcherStore.settings.env_vars}
+						onchange={(vars) =>
+							(launcherStore.settings.env_vars = vars)}
+					/>
+				</CollapsibleSection>
+			</div>
+		{/if}
+	</div>
+
+	<div class="save-footer">
+		<button
+			type="button"
+			class="qm-save-btn"
+			onclick={handleSave}
+			disabled={saving}
+		>
+			{saving ? t("settings.java.saving") : t("settings.java.saveBtn")}
+		</button>
+	</div>
+
+	<!-- Footer -->
+	<div class="qm-footer">
+		<span class="qm-version">MoonlightLauncher v{displayVersion}</span>
+	</div>
+</div>
+
+<style>
+	.qm-tab-btn {
+		border-radius: var(--launcher-control-radius);
+	}
+
+	.qm-tab-btn.active {
+		background: var(--launcher-selected);
+	}
+
+	.qm-scroll {
+		scrollbar-width: none;
+	}
+
+	.qm-scroll::-webkit-scrollbar {
+		display: none;
+		width: 0;
+		height: 0;
+	}
+
+	.section-group {
+		border: 1px solid var(--border-color);
+		border-radius: var(--launcher-radius);
+		overflow: hidden;
+		margin-bottom: calc(16px * var(--cubic-interface-gap-factor, 1));
+	}
+
+	.section-group :global(.cs-root) {
+		border: none;
+		border-bottom: 1px solid var(--border-color);
+	}
+
+	.section-group :global(.cs-root:last-child) {
+		border-bottom: none;
+	}
+
+	.qm-field {
+		margin-bottom: calc(15px * var(--cubic-interface-gap-factor, 1));
+	}
+
+	.qm-field label {
+		display: block;
+		font-size: 0.8rem;
+		color: var(--text-secondary);
+		margin-bottom: 6px;
+	}
+
+	.qm-save-btn {
+		width: 100%;
+		background: var(--accent);
+		color: var(--accent-text);
+		border: 1px solid var(--border-color);
+		padding: 10px 12px;
+		border-radius: var(--launcher-control-radius);
+		font-family: var(--font-family);
+		font-weight: 600;
+		cursor: pointer;
+		transition:
+			background 0.15s,
+			border-color 0.15s;
+		box-shadow: var(--shadow-sm);
+	}
+
+	.qm-save-btn:hover:not(:disabled) {
+		background: var(--accent-hover);
+		border-color: var(--border-color);
+	}
+
+	.qm-save-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.save-footer {
+		padding: 12px 20px;
+		border-top: 1px solid var(--border-color);
+	}
+
+	.jvm-args-textarea {
+		width: 100%;
+		background: var(--bg-input);
+		border: 1px solid var(--border-color);
+		color: var(--text-primary);
+		padding: 8px 10px;
+		border-radius: var(--border-radius-sm);
+		font-size: 0.85rem;
+		resize: vertical;
+		min-height: 60px;
+		font-family: var(--font-family-mono);
+		box-shadow: var(--shadow-inset);
+		box-sizing: border-box;
+	}
+
+	.jvm-args-textarea:focus {
+		outline: none;
+		border-color: var(--text-muted);
+	}
+
+	.zulu-credit {
+		margin-top: 12px;
+		font-size: 0.7rem;
+		color: var(--text-muted);
+		text-align: center;
+		opacity: 0.7;
+	}
+
+	.qm-themes-hint {
+		display: block;
+		margin-top: 8px;
+		font-size: 0.75rem;
+		color: var(--text-secondary);
+		line-height: 1.4;
+		cursor: pointer;
+		transition: color 0.2s;
+	}
+
+	.qm-themes-hint:hover {
+		color: var(--text-primary);
+	}
+
+	.about-content {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 14px;
+		padding: 8px 4px;
+		text-align: center;
+	}
+
+	.about-desc {
+		font-size: 0.8rem;
+		color: var(--text-secondary);
+		line-height: 1.5;
+		max-width: 280px;
+		margin: 0;
+	}
+
+
+	.qm-console-limit-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		background: var(--bg-input);
+		border: 1px solid var(--border-color);
+		border-radius: var(--border-radius-sm);
+		padding: 6px 10px;
+		box-shadow: var(--shadow-inset);
+		max-width: 180px;
+	}
+
+	.qm-console-limit-input {
+		flex: 1;
+		background: transparent;
+		border: none;
+		color: var(--text-primary);
+		font-family: var(--font-family);
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: right;
+		padding: 0;
+		width: 100%;
+		appearance: textfield;
+		-moz-appearance: textfield;
+	}
+
+	.qm-console-limit-input::-webkit-outer-spin-button,
+	.qm-console-limit-input::-webkit-inner-spin-button {
+		-webkit-appearance: none;
+		margin: 0;
+	}
+
+	.qm-console-limit-input:focus {
+		outline: none;
+	}
+
+	.qm-console-limit-divider,
+	.qm-console-limit-max {
+		font-size: 0.85rem;
+		color: var(--text-muted);
+		font-weight: 600;
+		user-select: none;
+	}
+
+	.qm-hint-not-recommended {
+		display: block;
+		font-size: 0.75rem;
+		color: var(--color-warning);
+		font-weight: 500;
+		margin-top: 2px;
+	}
+</style>

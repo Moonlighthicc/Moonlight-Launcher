@@ -1,0 +1,82 @@
+name: Build Release Draft
+
+on:
+    push:
+        tags:
+            - "v*"
+
+env:
+    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+    build:
+        name: Build (${{ matrix.platform }}${{ matrix.args }})
+        permissions:
+            contents: write
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - platform: "macos-latest"
+                      rust_target: "aarch64-apple-darwin"
+                      args: "--target aarch64-apple-darwin"
+                    - platform: "macos-latest"
+                      rust_target: "x86_64-apple-darwin"
+                      args: "--target x86_64-apple-darwin"
+                    - platform: "ubuntu-22.04"
+                      rust_target: "x86_64-unknown-linux-gnu"
+                      args: ""
+                    - platform: "windows-latest"
+                      rust_target: "x86_64-pc-windows-msvc"
+                      args: "-b nsis"
+
+        runs-on: ${{ matrix.platform }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup Bun
+              uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: latest
+
+            - name: Install Linux dependencies
+              if: matrix.platform == 'ubuntu-22.04'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+            - name: Install Rust stable
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.rust_target }}
+
+            - name: Rust cache
+              uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: ". -> target"
+                  # Reuse the default-branch cache seeded by prerelease.yml.
+                  # Include the target, not just the host: both macOS jobs run on ARM.
+                  shared-key: tauri-release-${{ matrix.platform }}-${{ matrix.rust_target }}
+                  # Tag-scoped caches cannot be reused by the next release tag.
+                  save-if: "false"
+
+            - name: Install frontend dependencies
+              run: bun install --frozen-lockfile
+
+            - name: Verify bundled version and release tag
+              run: bun test --conditions=browser ./tests/frontend/ui/versionMetadata.test.mjs
+
+            - name: Build and upload to draft
+              uses: tauri-apps/tauri-action@v1
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+                  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+              with:
+                  tagName: ${{ github.ref_name }}
+                  releaseName: "moonlauncher ${{ github.ref_name }}"
+                  releaseDraft: true
+                  prerelease: ${{ contains(github.ref_name, '-') }}
+                  includeUpdaterJson: true
+                  updaterJsonPreferNsis: true
+                  args: ${{ matrix.args }} -- --locked

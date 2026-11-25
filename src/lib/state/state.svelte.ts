@@ -1,0 +1,241 @@
+import type {
+	InstanceDto,
+	Settings,
+	Notification,
+	NotificationType,
+	JreInstallPrompt,
+	PendingJreLaunch,
+	MinecraftUser,
+} from "../types/types";
+import { DEFAULT_CONSOLE_HISTORY_LIMIT } from "$lib/components/log/logHelpers";
+import { t } from "$lib/i18n";
+import { DEFAULT_NOTIFICATION_PREFERENCES } from "$lib/components/ui/notificationPreferences";
+import { DEFAULT_INTERFACE_PREFERENCES } from "$lib/utils/interfacePreferences";
+import { TILE_RANGE_DEFAULTS } from "./tileDefaults";
+
+export interface LauncherState {
+	loadedInstances: InstanceDto[];
+	instancesLoading: boolean;
+	currentInstance: InstanceDto | null;
+	runningInstances: string[];
+	settings: Settings;
+	notifications: Notification[];
+	jreInstallPrompt: JreInstallPrompt | null;
+	pendingJreLaunch: PendingJreLaunch | null;
+	reauthPrompt: Pick<
+		MinecraftUser,
+		"uuid" | "username" | "user_type" | "yggdrasil_server_url"
+	> | null;
+}
+
+export const launcherStore = $state<LauncherState>({
+	loadedInstances: [],
+	instancesLoading: true,
+	currentInstance: null,
+	runningInstances: [],
+	notifications: [],
+	jreInstallPrompt: null,
+	pendingJreLaunch: null,
+	reauthPrompt: null,
+	settings: {
+		user: [],
+		active_user_idx: 0,
+		min_memory: 1024,
+		max_memory: 2048,
+		use_recommended_ram: true,
+		jre8_path: "",
+		jre8_managed: true,
+		jre8_vendor: "auto",
+		jre17_path: "",
+		jre17_managed: true,
+		jre17_vendor: "auto",
+		jre21_path: "",
+		jre21_managed: true,
+		jre21_vendor: "auto",
+		jre25_path: "",
+		jre25_managed: true,
+		jre25_vendor: "auto",
+		language: "en",
+		auto_updates: false,
+		update_channel: "stable",
+		close_launcher_on_play: true,
+		hide_on_launch: false,
+		restore_last_instance: false,
+		open_console_on_launch: false,
+		console_history_limit: DEFAULT_CONSOLE_HISTORY_LIMIT,
+		console_show_level_tags: true,
+		show_snapshots: false,
+		show_alpha: false,
+		show_unstable_loaders: false,
+		jvm_args: "",
+		env_vars: {},
+		theme: "dark",
+		discord_presence: false,
+		show_tutorial: true,
+		license_accepted: false,
+		market_filter_collapsed: true,
+		prominent_notifications: false,
+		notification_preferences: { ...DEFAULT_NOTIFICATION_PREFERENCES },
+		interface_preferences: { ...DEFAULT_INTERFACE_PREFERENCES },
+		reduce_animations: false,
+		disable_blur_effects: false,
+		disable_infinite_animations: false,
+		disable_skin3d_animations: false,
+		reduce_log_animations: false,
+		disable_background_image: false,
+		reduce_skin3d_quality: false,
+		download_provider: "official",
+		...TILE_RANGE_DEFAULTS,
+		tile_slider_height: 0,
+		tile_slider_layout: "size",
+		tile_slider_hide_text: false,
+		screenshot_interval: 5,
+		tile_side: "auto",
+		tile_style: "standard",
+		tile_text_pos: "auto",
+	},
+});
+
+const MAX_NOTIFICATIONS = 5;
+
+export function addNotification(
+	title: string,
+	message: string,
+	type: NotificationType = "info",
+	timeout = 5000,
+) {
+	const id = Math.random().toString(36).substring(2, 9);
+	const notification: Notification = { id, title, message, type, timeout };
+
+	launcherStore.notifications.push(notification);
+	if (launcherStore.notifications.length > MAX_NOTIFICATIONS) {
+		launcherStore.notifications.splice(
+			0,
+			launcherStore.notifications.length - MAX_NOTIFICATIONS,
+		);
+	}
+
+	return id;
+}
+
+export function removeNotification(id: string) {
+	const idx = launcherStore.notifications.findIndex((n) => n.id === id);
+	if (idx !== -1) launcherStore.notifications.splice(idx, 1);
+}
+
+export function updateNotification(
+	id: string,
+	updates: Partial<Omit<Notification, "id">>,
+) {
+	const notification = launcherStore.notifications.find((n) => n.id === id);
+	if (!notification) return;
+	Object.assign(notification, updates);
+}
+
+export function showError(title: string, message: string) {
+	return addNotification(title, message, "error", 8000);
+}
+
+export function showSuccess(title: string, message: string) {
+	return addNotification(title, message, "success", 4000);
+}
+
+export function showWarning(title: string, message: string) {
+	return addNotification(title, message, "warning", 6000);
+}
+
+export function showInfo(title: string, message: string) {
+	return addNotification(title, message, "info", 4000);
+}
+
+export function showJreInstallPrompt(
+	version: number,
+	instance: InstanceDto,
+	serverAddress?: string,
+) {
+	launcherStore.jreInstallPrompt = { version, instance, serverAddress };
+}
+
+export function dismissJreInstallPrompt() {
+	launcherStore.jreInstallPrompt = null;
+}
+
+export function setPendingJreLaunch(
+	version: number,
+	instance: InstanceDto,
+	serverAddress?: string,
+) {
+	launcherStore.pendingJreLaunch = { version, instance, serverAddress };
+}
+
+export function clearPendingJreLaunch() {
+	launcherStore.pendingJreLaunch = null;
+}
+
+/** Proveedor de JRE configurado para una versión de Java. */
+export function jreVendorFor(version: number): string {
+	switch (version) {
+		case 8:
+			return launcherStore.settings.jre8_vendor || "auto";
+		case 17:
+			return launcherStore.settings.jre17_vendor || "auto";
+		case 21:
+			return launcherStore.settings.jre21_vendor || "auto";
+		case 25:
+			return launcherStore.settings.jre25_vendor || "auto";
+		default:
+			return "auto";
+	}
+}
+
+/** Guarda el proveedor de JRE elegido para una versión de Java. */
+export function setJreVendor(version: number, vendor: string) {
+	switch (version) {
+		case 8:
+			launcherStore.settings.jre8_vendor = vendor;
+			break;
+		case 17:
+			launcherStore.settings.jre17_vendor = vendor;
+			break;
+		case 21:
+			launcherStore.settings.jre21_vendor = vendor;
+			break;
+		case 25:
+			launcherStore.settings.jre25_vendor = vendor;
+			break;
+	}
+}
+
+export function showErrorParsed(rawError: unknown) {
+	try {
+		const parsed = JSON.parse(rawError as string);
+		if (parsed.code) {
+			if (parsed.code === "AUTH_SESSION_EXPIRED") {
+				const user =
+					launcherStore.settings.user[
+						launcherStore.settings.active_user_idx
+					];
+				if (user && user.user_type !== "Cracked") {
+					launcherStore.reauthPrompt = {
+						uuid: user.uuid,
+						username: user.username,
+						user_type: user.user_type,
+						yggdrasil_server_url: user.yggdrasil_server_url,
+					};
+					return;
+				}
+			}
+			const params = parsed.params || {};
+			const msg = t(`errors.${parsed.code}`, params);
+			if (parsed.code === "INST_VERSION_NOT_FOUND") {
+				showWarning(t("errors.warningTitle"), msg);
+			} else {
+				showError(t("errors.title"), msg);
+			}
+			return;
+		}
+	} catch {
+		// JSON parse failed, fall through
+	}
+	addNotification(t("errors.title"), String(rawError), "error", 8000);
+}

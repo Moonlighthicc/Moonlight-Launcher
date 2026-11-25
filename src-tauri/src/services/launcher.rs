@@ -1,0 +1,1511 @@
+use crate::commands::log_window::{open_log_window_for_instance, wants_log_preview};
+use crate::core::event_bus::{AppEvent, emit};
+use crate::core::path_manager::PathManager;
+use crate::core::{AppError, AuthError, DownloadError, FsError, InstanceError};
+use crate::services::SettingsManager;
+use crate::services::SettingsSnapshot;
+use crate::services::discord_presence;
+use crate::services::download_queue::DownloadQueue;
+#[cfg(test)]
+use crate::services::instance_manager::{register_kill_sender, unregister_kill_sender};
+use crate::services::instance_manager::{
+    InstanceHandle, InstanceStatus, register_kill_sender_with_id, unregister_kill_sender_process, has_running_processes,
+};
+use crate::services::java_manager::JavaManager;
+use crate::services::launch_window::LaunchSession;
+use aqua::JavaVersion;
+use compact_str::{CompactString, ToCompactString};
+use launchwerk::auth::{
+    AccountType, MinecraftUser,
+    microsoft::MicrosoftAuth,
+    yggdrasil::{self, YggdrasilAuth},
+};
+use launchwerk::models::VersionManifest;
+use launchwerk::{LaunchConfig, Launchwerk};
+use parking_lot::RwLock;
+use regex::Regex;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use tauri::{Emitter, EventTarget, Manager};
+use tokio::fs;
+use tokio::sync::broadcast;
+use tracing::{debug, error, info, trace, warn};
+use zellkern::{GameVersion, Loader};
+
+use dashmap::DashMap;
+
+// Matches the console's visible history cap in the frontend
+// (DEFAULT_CONSOLE_HISTORY_LIMIT). Anything above it is never rendered.
+const LOG_RING_CAPACITY: usize = 3000;
+
+static LINE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// ── Log Level ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// No se pudo clasificar la línea.
+    Unknown,
+    /// Error estándar genérico.
+    Stderr,
+    /// Mensajes propios del launcher.
+    Launcher,
+    Trace,
+    Debug,
+    Info,
+    /// Mensajes de Minecraft u otros sin tag (texto plano).
+    Message,
+    Warn,
+    Error,
+    Fatal,
+}
+
+impl LogLevel {
+    /// Detecta el nivel de una línea de log siguiendo formatos comunes de
+    /// Minecraft, log4j/logback y Java.
+    pub fn from_line(line: &str, stderr: bool) -> Self {
+        let stripped = strip_ansi(line);
+
+        // Mensajes marcados por el launcher.
+        if stripped.trim_start().starts_with("[moonlauncher]")
+            || stripped.trim_start().starts_with("[Cubite]")
+        {
+            return Self::Launcher;
+        }
+
+        // Formato típico de Minecraft/modloaders:
+        // [12:34:56] [Server thread/INFO]: ...
+        if let Some(cap) = minecraft_level_regex().captures(&stripped)
+            && let Some(level) = cap.get(1)
+        {
+            return Self::from_keyword(level.as_str());
+        }
+
+        // Palabra de nivel suelta al inicio de la línea (log4j básico, etc).
+        if let Some(cap) = leading_level_regex().captures(&stripped)
+            && let Some(level) = cap.get(1)
+        {
+            return Self::from_keyword(level.as_str());
+        }
+
+        if stderr { Self::Stderr } else { Self::Message }
+    }
+
+    fn from_keyword(word: &str) -> Self {
+        match word.to_uppercase().as_str() {
+            "TRACE" => Self::Trace,
+            "DEBUG" => Self::Debug,
+            "INFO" | "CONFIG" | "FINE" | "FINER" | "FINEST" => Self::Info,
+            "WARN" | "WARNING" => Self::Warn,
+            "ERROR" => Self::Error,
+            "FATAL" | "SEVERE" => Self::Fatal,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+fn minecraft_level_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\[[^\]/\s]{1,60}/\s*(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|SEVERE|CONFIG|FINE|FINER|FINEST)\s*\]").unwrap()
+    })
+}
+
+fn leading_level_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^(?:\d{4}[-/]\d{2}[-/]\d{2}[\sT])?(?:\d{1,2}:\d{2}:\d{2}(?:\.\d+)?(?:\s*[AP]M)?\s+)?(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|SEVERE)\b").unwrap()
+    })
+}
+
+fn ansi_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[\x1b\x9b]\[[0-?]*[ -/]*[@-~]").unwrap())
+}
+
+fn strip_ansi(line: &str) -> String {
+    ansi_regex().replace_all(line, "").into_owned()
+}
+
+/// Limpia líneas que puedan contener credenciales. Oculta solo el valor,
+/// no descarta la línea completa.
+fn sanitize_line(line: &str) -> String {
+    crate::core::sanitize::redact_log_line(line).into_owned()
+}
+
+// ── User-aware Sensitive Data Filter ────────────────────────────────────────
+
+#[derive(Clone)]
+struct SensitiveFilter {
+    patterns: Vec<(Regex, String)>,
+}
+
+impl SensitiveFilter {
+    fn from_user(user: &MinecraftUser) -> Self {
+        let mut patterns = Vec::new();
+
+        let mut add = |value: &str, label: &str| {
+            if value.len() >= 2 {
+                patterns.push((value.to_string(), format!("<{label}>")));
+            }
+        };
+
+        add(&user.username, "username");
+        add(&user.uuid, "uuid");
+
+        // Only mask real-looking secrets to avoid replacing short placeholders
+        // such as the cracked account access_token "0".
+        if user.user_type != AccountType::Cracked && user.access_token.len() >= 8 {
+            add(&user.access_token, "access_token");
+        }
+        if user.user_type != AccountType::Cracked {
+            if let Some(ref token) = user.refresh_token
+                && token.len() >= 8
+            {
+                add(token, "refresh_token");
+            }
+            if let Some(ref token) = user.client_token
+                && token.len() >= 8
+            {
+                add(token, "client_token");
+            }
+        }
+
+        // Replace longest needles first to avoid partial matches shadowing longer values.
+        patterns.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
+
+        let compiled = patterns
+            .into_iter()
+            .filter_map(|(needle, replacement)| {
+                let escaped = regex::escape(&needle);
+                Regex::new(&format!(r"(?i)\b{}\b", escaped))
+                    .ok()
+                    .map(|re| (re, replacement))
+            })
+            .collect();
+
+        Self { patterns: compiled }
+    }
+
+    fn apply(&self, line: &str) -> String {
+        let mut out = line.to_string();
+        for (re, replacement) in &self.patterns {
+            out = re.replace_all(&out, replacement.as_str()).into_owned();
+        }
+        out
+    }
+}
+
+static USER_FILTER: OnceLock<RwLock<Option<Arc<SensitiveFilter>>>> = OnceLock::new();
+
+fn user_filter() -> &'static RwLock<Option<Arc<SensitiveFilter>>> {
+    USER_FILTER.get_or_init(|| RwLock::new(None))
+}
+
+/// Crea o actualiza el filtro de datos sensibles a partir del usuario activo.
+/// Debe llamarse después de cargar los tokens del almacenamiento seguro.
+pub(crate) fn set_user_filter(user: &MinecraftUser) {
+    let filter = Arc::new(SensitiveFilter::from_user(user));
+    *user_filter().write() = Some(filter);
+}
+
+/// Sanitiza una línea aplicando el filtro de usuario (si existe) y luego el
+/// reemplazo genérico de tokens.
+pub(crate) fn sanitize_with_user(line: &str) -> String {
+    let guard = user_filter().read();
+    let user_cleaned = guard
+        .as_ref()
+        .map(|filter| filter.apply(line))
+        .unwrap_or_else(|| line.to_string());
+    drop(guard);
+    sanitize_line(&user_cleaned)
+}
+
+// ── Log Ring Buffer ─────────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Serialize)]
+pub struct LogLine {
+    pub id: u64,
+    pub text: Arc<str>,
+    pub stream: String,
+    pub level: LogLevel,
+    pub timestamp: u64,
+}
+
+struct LogLineRaw {
+    id: u64,
+    text: Arc<str>,
+    stream: u8,
+    level: LogLevel,
+    timestamp: u64,
+}
+
+pub struct LogRing {
+    inner: tokio::sync::Mutex<VecDeque<LogLineRaw>>,
+}
+
+impl LogRing {
+    fn new() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(VecDeque::with_capacity(LOG_RING_CAPACITY)),
+        }
+    }
+
+    pub async fn push(&self, text: Arc<str>, level: LogLevel, stream: u8) -> (u64, u64) {
+        let mut guard = self.inner.lock().await;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if guard.len() >= LOG_RING_CAPACITY {
+            guard.pop_front();
+        }
+        let id = LINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        guard.push_back(LogLineRaw {
+            id,
+            text,
+            stream,
+            level,
+            timestamp: ts,
+        });
+        (id, ts)
+    }
+
+    pub async fn snapshot(&self, limit: Option<usize>) -> Vec<LogLine> {
+        let guard = self.inner.lock().await;
+        let to_skip = limit.and_then(|l| guard.len().checked_sub(l)).unwrap_or(0);
+        guard
+            .iter()
+            .skip(to_skip)
+            .map(|raw| LogLine {
+                id: raw.id,
+                text: raw.text.clone(),
+                stream: match raw.stream {
+                    0 => "stdout".into(),
+                    1 => "stderr".into(),
+                    _ => "launcher".into(),
+                },
+                level: raw.level,
+                timestamp: raw.timestamp,
+            })
+            .collect()
+    }
+}
+
+static LOG_RINGS: OnceLock<DashMap<Arc<str>, Arc<LogRing>>> = OnceLock::new();
+
+fn get_log_ring(id: &str) -> Arc<LogRing> {
+    let map = LOG_RINGS.get_or_init(DashMap::new);
+    map.entry(Arc::from(id))
+        .or_insert_with(|| Arc::new(LogRing::new()))
+        .clone()
+}
+
+pub async fn get_log_history(id: &str, limit: Option<usize>) -> Vec<LogLine> {
+    let ring = {
+        let map = LOG_RINGS.get_or_init(DashMap::new);
+        map.get(id).map(|entry| entry.clone())
+    };
+
+    if let Some(ring) = ring {
+        ring.snapshot(limit).await
+    } else {
+        get_crash_log_snapshot(id, limit).await.unwrap_or_default()
+    }
+}
+
+pub fn remove_log_ring(id: &str) {
+    if let Some(map) = LOG_RINGS.get() {
+        map.remove(id);
+    }
+}
+
+struct CrashLogSnapshot {
+    lines: Vec<LogLine>,
+    created: std::time::Instant,
+}
+
+/// Guarda un snapshot de los logs de una instancia antes de descartar el
+/// anillo, para que la ventana de logs del crash siga teniendo historial.
+pub async fn save_crash_log_snapshot(id: &str) {
+    let snapshot = CrashLogSnapshot {
+        lines: get_log_ring(id).snapshot(None).await,
+        created: std::time::Instant::now(),
+    };
+    crash_log_snapshots().insert(Arc::from(id), snapshot);
+    cleanup_crash_log_snapshots();
+}
+
+pub fn clear_crash_log_snapshot(id: &str) {
+    crash_log_snapshots().remove(id);
+}
+
+async fn get_crash_log_snapshot(id: &str, limit: Option<usize>) -> Option<Vec<LogLine>> {
+    crash_log_snapshots().get(id).map(|entry| {
+        let lines = &entry.value().lines;
+        let to_skip = limit.and_then(|l| lines.len().checked_sub(l)).unwrap_or(0);
+        lines.iter().skip(to_skip).cloned().collect()
+    })
+}
+
+fn crash_log_snapshots() -> &'static DashMap<Arc<str>, CrashLogSnapshot> {
+    static SNAPSHOTS: OnceLock<DashMap<Arc<str>, CrashLogSnapshot>> = OnceLock::new();
+    SNAPSHOTS.get_or_init(DashMap::new)
+}
+
+const CRASH_LOG_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const CRASH_LOG_SNAPSHOT_MAX: usize = 8;
+
+fn cleanup_crash_log_snapshots() {
+    let now = std::time::Instant::now();
+    let snapshots = crash_log_snapshots();
+    snapshots.retain(|_, snapshot| now.duration_since(snapshot.created) < CRASH_LOG_SNAPSHOT_TTL);
+    // Repeated crashes must not keep full log rings alive indefinitely.
+    while snapshots.len() > CRASH_LOG_SNAPSHOT_MAX {
+        let Some(oldest) = snapshots
+            .iter()
+            .min_by_key(|entry| entry.value().created)
+            .map(|entry| entry.key().clone())
+        else {
+            break;
+        };
+        snapshots.remove(&oldest);
+    }
+}
+
+/// Añade un mensaje del launcher al anillo de logs de una instancia.
+/// Sanitiza el contenido para evitar fugas de datos de la cuenta activa.
+pub async fn push_launcher_message(id: &str, message: impl Into<String>) {
+    let sanitized = sanitize_with_user(&message.into());
+    get_log_ring(id)
+        .push(Arc::from(sanitized), LogLevel::Launcher, 2)
+        .await;
+}
+
+// ── Log Event Payloads ──────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Serialize)]
+struct LogEntryEvent {
+    id: u64,
+    line: Arc<str>,
+    stream: &'static str,
+    level: LogLevel,
+    timestamp: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct LogBatchEvent<'a> {
+    id: &'a str,
+    lines: &'a [LogEntryEvent],
+}
+
+// ── Statics ───────────────────────────────────────────────────────────────────
+
+static LAUNCHER: OnceLock<Arc<Launcher>> = OnceLock::new();
+
+// ── Launcher ──────────────────────────────────────────────────────────────────
+//
+// Solo responsabilidad: lanzar instancias.
+// Ya no mezcla la lógica de descargas.
+
+pub struct Launcher {
+    app_handle: std::sync::Mutex<Option<tauri::AppHandle>>,
+}
+
+struct LaunchAttempt(InstanceHandle);
+
+impl LaunchAttempt {
+    fn finish(&self, result: &Result<(), AppError>) {
+        if let Err(error) = result && matches!(self.0.get_status(), InstanceStatus::Starting) {
+            if has_running_processes(&self.0.uuid) {
+                self.0.set_status(InstanceStatus::Started);
+            } else {
+                self.0.set_status(InstanceStatus::Error(error.to_string()));
+            }
+        }
+    }
+}
+
+impl Drop for LaunchAttempt {
+    fn drop(&mut self) {
+        if matches!(self.0.get_status(), InstanceStatus::Starting) {
+            self.0.set_status(if has_running_processes(&self.0.uuid) { InstanceStatus::Started } else { InstanceStatus::Off });
+        }
+    }
+}
+
+impl Launcher {
+    pub fn get() -> &'static Arc<Launcher> {
+        LAUNCHER
+            .get()
+            .expect("BUG: Launcher used before initialization")
+    }
+
+    pub fn init() -> Arc<Self> {
+        let launcher = Arc::new(Self {
+            app_handle: std::sync::Mutex::new(None),
+        });
+        let _ = LAUNCHER.set(launcher.clone());
+        launcher
+    }
+
+    pub fn set_handle(&self, handle: tauri::AppHandle) {
+        *self.app_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    pub async fn launch(
+        self: &Arc<Self>,
+        handle: InstanceHandle,
+        server: Option<super::server_status::ServerAddress>,
+    ) -> Result<(), AppError> {
+        trace!("=== CubicLaunchwerk ===");
+        let shared_guard = super::shared_storage::acquire().await;
+        let files_guard = handle
+            .try_lock_files()
+            .map_err(|_| AppError::Instance(InstanceError::FileOperationInProgress))?;
+
+        if matches!(handle.get_status(), InstanceStatus::Starting) {
+            warn!("The instance is already starting");
+            return Err(AppError::Instance(InstanceError::AlreadyStarted));
+        }
+        clear_crash_log_snapshot(&handle.uuid);
+        handle.set_status(InstanceStatus::Starting);
+        drop(files_guard);
+
+        let attempt = LaunchAttempt(handle.clone());
+        let launcher = self.clone();
+        // A confirmed launch owns preparation through the hand-off to its process
+        // supervisor, even if the requesting WebView is destroyed meanwhile.
+        tokio::spawn(async move {
+            let result = launcher.launch_inner(handle, server, shared_guard).await;
+            attempt.finish(&result);
+            result
+        })
+        .await
+        .map_err(|e| AppError::CoreError(crate::core::CoreError::Other(e.to_string())))?
+    }
+
+    async fn launch_inner(
+        &self,
+        handle: InstanceHandle,
+        server: Option<super::server_status::ServerAddress>,
+        shared_guard: super::shared_storage::SharedGuard,
+    ) -> Result<(), AppError> {
+        let settings_m = SettingsManager::launch_snapshot();
+        let hide_on_launch = SettingsManager::read().hide_on_launch;
+
+        let version = handle.get_version().await;
+        let name = handle.get_name().await;
+        let shared_dir = PathManager::get().get_shared_dir();
+        let instance_dir = PathManager::get().get_instance_dir().join(name.as_ref());
+
+        if !instance_dir.exists() {
+            fs::create_dir(&instance_dir)
+                .await
+                .map_err(|e| FsError::CreateDir {
+                    path: instance_dir.to_string_lossy().to_string(),
+                    source: e,
+                })?;
+        }
+
+        // Las versiones anteriores a 1.6 leen `texturepacks`, no `resourcepacks`.
+        if let Err(e) =
+            crate::services::pack_dir::migrate_legacy_packs(&instance_dir, &version).await
+        {
+            warn!(
+                "Could not migrate the texture packs of '{}': {}",
+                name, e
+            );
+        }
+
+        // Si la versión o alguna de sus dependencias no está descargada,
+        // encolar la descarga y salir con error descriptivo.
+        // El frontend puede escuchar "download-finished" y reintentar el launch
+        let check_shared = shared_dir.clone();
+        let check_version = version.clone();
+        let check_guard = shared_guard.clone();
+        let missing = tokio::task::spawn_blocking(move || {
+            let _shared_guard = check_guard;
+            super::version_installation::missing_dependencies(&check_shared, &check_version)
+        })
+        .await
+        .map_err(|e| crate::core::CoreError::Other(e.to_string()))?;
+        if !missing.is_empty() {
+            info!(
+                "Missing dependencies for {}: {:?}, queueing automatic download...",
+                version, missing
+            );
+            DownloadQueue::get().enqueue(version.clone()).await;
+            handle.set_status(if has_running_processes(&handle.uuid) { InstanceStatus::Started } else { InstanceStatus::Off });
+            return Err(AppError::Instance(InstanceError::VersionNotFound(
+                version.to_string(),
+            )));
+        }
+
+        let version_json = shared_dir.join(format!("versions/{}/{}.json", version, version));
+
+        let manifest = VersionManifest::from_file(version_json)
+            .map_err(|e| DownloadError::ParseJson(e.to_string()))?;
+        let mut user = SettingsManager::read().get_user();
+
+        // Resolve java version through inheritsFrom chain (Forge version.json may omit it)
+        let mut java_version_req = if manifest.java_version.is_some() {
+            manifest.java_version.clone()
+        } else {
+            manifest.inherits_from.as_ref().and_then(|parent_id| {
+                let parent_path = shared_dir.join(format!("versions/{parent_id}/{parent_id}.json"));
+                VersionManifest::from_file(parent_path)
+                    .ok()
+                    .and_then(|p| p.java_version)
+            })
+        };
+
+        // If the manifest does not declare a Java version, infer one from the
+        // Minecraft version string so we do not default unconditionally to Java 25.
+        if java_version_req.is_none() {
+            let game_version = GameVersion::from_version_id(&manifest.id_raw);
+            let inferred = aqua::infer_java_version(&game_version.mc_version);
+            info!(
+                "No explicit java_version for {}; inferred Java {}",
+                manifest.id_raw, inferred
+            );
+            java_version_req = Some(JavaVersion {
+                component: String::new(),
+                major_version: inferred,
+            });
+        }
+
+        // Forge/NeoForge ModLauncher requires Java 16+; bump if manifest says < 16.
+        // But Forge < 36.2.26 bundles ModLauncher 8.0.9 which has a broken
+        // ManifestEntryVerifier constructor — only bump for >= 36.2.26.
+        let loader = Loader::from_version_id(&manifest.id_raw);
+        if let Some(ref mut jv) = java_version_req
+            && matches!(loader, Loader::Forge(_) | Loader::NeoForge(_))
+            && jv.major_version < 16
+        {
+            let should_bump = match &loader {
+                Loader::Forge(id) => is_forge_version_safe(id),
+                Loader::NeoForge(_) => true,
+                _ => false,
+            };
+            if should_bump {
+                info!(
+                    "Forge/NeoForge detected (Java {} requested), upgrading to Java 17",
+                    jv.major_version
+                );
+                debug!("Forge version safe for Java 17 bump, setting major_version to 17");
+                jv.major_version = 17;
+            } else {
+                info!(
+                    "Old Forge detected (Java {} requested), keeping Java 8",
+                    jv.major_version
+                );
+                debug!("Forge version NOT safe for Java 17, staying at Java 8");
+            }
+        }
+        let overrides = handle.get_overrides().await;
+        let (java_version, java_path) = if let Some(ref overrides) = overrides {
+            if let Some(java_meta) = overrides.java_version {
+                resolve_java_path(
+                    &settings_m,
+                    Some(&JavaVersion {
+                        component: String::new(),
+                        major_version: java_meta,
+                    }),
+                )
+            } else {
+                resolve_java_path(&settings_m, java_version_req.as_ref())
+            }
+        } else {
+            resolve_java_path(&settings_m, java_version_req.as_ref())
+        };
+
+        if !java_path.exists() {
+            let reason = InstanceError::JreNotFound(java_version.to_string()).to_string();
+            handle.set_status(InstanceStatus::Error(reason));
+            Err(AppError::Instance(InstanceError::JreNotFound(
+                java_version.to_string(),
+            )))?;
+        }
+        info!("Starting with {}", java_path.display());
+        // Auto-refresh del token Microsoft — el lock de settings se toma y suelta rápido
+        user = refresh_microsoft_token(user, false).await?;
+
+        // Auto-refresh del token Yggdrasil
+        user = refresh_yggdrasil_token(user).await?;
+        set_user_filter(&user);
+
+        // let min_mem = format!("{}G", settings_m.min_memory);
+        // let max_mem = format!("{}G", settings_m.max_memory);
+
+        let (max_mem, min_mem) =
+            if let Some(ram_overrides) = overrides.as_ref().and_then(|o| o.memory) {
+                let max_memf = format!("{}M", ram_overrides.max_mem);
+                let min_memf = format!("{}M", ram_overrides.min_mem);
+                (max_memf, min_memf)
+            } else {
+                let min_memf = format!("{}M", settings_m.min_memory);
+                let max_memf = format!("{}M", settings_m.max_memory);
+                (max_memf, min_memf)
+            };
+
+        // Datos que necesitamos mostrar en el log antes de mover los originales.
+        let java_path_str = java_path.display().to_string();
+        let min_mem_str = min_mem.clone();
+        let max_mem_str = max_mem.clone();
+
+        let mut builder = LaunchConfig::builder()
+            .java_path(java_path)
+            .username(user.username)
+            .auth_uuid(user.uuid)
+            .ram(min_mem, max_mem)
+            .cracked(user.user_type == AccountType::Cracked);
+
+        if let Some(server) = server {
+            let target = super::server_status::resolve_target(&server).await;
+            builder = builder
+                .quick_play(launchwerk::QuickPlay::Multiplayer(server.authority()))
+                .legacy_server(target.host, target.port);
+        }
+
+        let mut extra_jvm_args: Vec<String> = Vec::new();
+
+        match user.user_type {
+            AccountType::Microsoft => {
+                builder = builder.access_token(user.access_token).user_type("msa");
+            }
+            AccountType::Yggdrasil => {
+                builder = builder.access_token(user.access_token).user_type("mojang");
+
+                let api_root = user.yggdrasil_server_url.as_deref().ok_or_else(|| {
+                    AuthError::SessionExpired("Missing Yggdrasil server address".into())
+                })?;
+                // This session must use the same API root for validation and in the JVM.
+                let jar_path = yggdrasil::download_authlib_injector(&shared_dir)
+                    .await
+                    .map_err(|_| DownloadError::Request("Authlib Injector".into()))?;
+                extra_jvm_args.push(format!("-javaagent:{}={}", jar_path.display(), api_root));
+                builder = builder.authlib_injector_path(jar_path);
+                if let Ok(metadata_b64) = yggdrasil::fetch_metadata_prefetch(api_root).await {
+                    builder = builder.yggdrasil_metadata_b64(metadata_b64);
+                }
+            }
+            AccountType::Cracked => {}
+        }
+
+        for (k, v) in &settings_m.env_vars {
+            if !k.is_empty() {
+                builder = builder.env(k.as_str(), v);
+            }
+        }
+
+        let parsed_jvm_args: Vec<String> = settings_m
+            .jvm_args
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        extra_jvm_args.extend(parsed_jvm_args);
+
+        // Argumentos JVM propios de la instancia (estilo MultiMC/Prism).
+        if let Some(instance_jvm_args) = overrides.as_ref().and_then(|o| o.jvm_args.as_ref()) {
+            extra_jvm_args.extend(
+                instance_jvm_args
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+            );
+        }
+
+        builder = builder.extra_jvm_args(extra_jvm_args);
+
+        let instance_name = name.clone();
+        let instance_version = version.clone();
+        push_launcher_message(
+            &handle.uuid,
+            format!(
+                "Starting instance \"{}\" ({})",
+                instance_name, instance_version
+            ),
+        )
+        .await;
+        push_launcher_message(
+            &handle.uuid,
+            format!("Java: {} (version {})", java_path_str, java_version),
+        )
+        .await;
+        push_launcher_message(
+            &handle.uuid,
+            format!("Memoria: {} / {}", min_mem_str, max_mem_str),
+        )
+        .await;
+
+        let mut options = builder.build();
+        let jar_config = handle.get_minecraft_jar().await;
+        if jar_config.is_active() {
+            let jar_manifest = manifest.clone();
+            let jar_shared = shared_dir.clone();
+            let jar_instance = instance_dir.clone();
+            let jar_options = options.clone();
+            let jar_guard = handle.try_lock_files();
+            let jar_shared_guard = shared_guard.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _shared_guard = jar_shared_guard;
+                // Keep filesystem admission even if launch is cancelled while patching.
+                let _jar_guard = jar_guard?;
+                let original = zellkern::CommandBuilder::new(
+                    &jar_manifest,
+                    &jar_shared,
+                    &jar_instance,
+                    &jar_options,
+                )
+                .original_minecraft_jar()
+                .map_err(|e| e.to_string())?;
+                super::minecraft_jar::prepare(&jar_instance, &original, &jar_config)
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|result| result);
+            match result {
+                Ok(path) => options.minecraft_jar = path,
+                Err(message) => {
+                    push_launcher_message(
+                        &handle.uuid,
+                        format!("Failed to prepare minecraft.jar: {message}"),
+                    )
+                    .await;
+                    handle.set_status(InstanceStatus::Error(message.clone()));
+                    return Err(AppError::Instance(InstanceError::MinecraftJar(message)));
+                }
+            }
+        }
+
+        // Auto-aplicar el perfil global de options.txt antes de lanzar. Un fallo
+        // aquí no impide el arranque del juego: se avisa y se continúa.
+        if handle.get_auto_apply_options().await
+            && let Some(profile_id) = handle.get_options_profile_id().await
+        {
+            match crate::services::options_profiles::get(profile_id.as_ref()) {
+                Some(profile) => {
+                    let opt_instance = instance_dir.clone();
+                    let opt_key = handle.uuid.to_string();
+                    let opt_backup_root = crate::services::options_profiles::backup_root();
+                    let opt_guard = handle.try_lock_files();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _guard = opt_guard.map_err(crate::core::CoreError::Other)?;
+                        crate::services::options_profiles::apply_to_instance(
+                            &opt_instance,
+                            &opt_key,
+                            &profile.content,
+                            crate::services::options_profiles::BackupMode::Rolling,
+                            &opt_backup_root,
+                        )
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(outcome)) => {
+                            if outcome.changed {
+                                info!("options.txt auto-applied from profile {}", profile_id);
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Could not auto-apply options.txt: {}", e);
+                            push_launcher_message(
+                                &handle.uuid,
+                                format!("Could not apply the options.txt profile: {e}"),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            warn!("The options.txt auto-apply task failed: {}", e);
+                        }
+                    }
+                }
+                None => {
+                    warn!(
+                        "options.txt profile {} not found, skipping auto-apply",
+                        profile_id
+                    );
+                }
+            }
+        }
+
+        // Resolve the root per launch, after storage admission, rather than
+        // retaining the directory that was active when the launcher started.
+        // Маркер готовности нужен и для индикатора запуска, независимо от скрытия лаунчера.
+        let beta_hide_delay = beta_readiness_delay(
+            &manifest.id_raw,
+            manifest.inherits_from.as_deref(),
+            true,
+        );
+        let lw = Arc::new(Launchwerk::new(shared_dir));
+        let lw_handle = lw.prepare(manifest, options, instance_dir);
+        handle.update_last_played().await;
+
+        let app_handle = self
+            .app_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let session = LaunchSession::new(app_handle.clone(), hide_on_launch);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        // Se activa cuando el cliente registra su cierre normal (`Stopping!`).
+        // Un apagado lento puede disparar el watchdog de Minecraft y terminar el
+        // proceso con un código distinto de cero: eso no es un crash.
+        let clean_shutdown = Arc::new(AtomicBool::new(false));
+        // Subscribe before spawning Java: the first messages can arrive immediately.
+        let io_task = spawn_io_forwarding(
+            app_handle.clone(),
+            handle.uuid.clone(),
+            lw_handle.subscribe_stdout(),
+            lw_handle.subscribe_stderr(),
+            Some(ready_tx),
+            clean_shutdown.clone(),
+        );
+
+        // Окно игры замечаем по самому окну, а не по записи в логе (она появляется позже).
+        let window_watch_stop = Arc::new(AtomicBool::new(false));
+        crate::services::instance_manager::spawn_window_watcher(
+            handle.uuid.to_string(),
+            handle.get_instance_dir().await,
+            window_watch_stop.clone(),
+        )
+        .await;
+
+        match lw_handle.launch().await {
+            Ok(_) => {
+                // Start the grace period only after Java was successfully spawned.
+                let beta_hide_deadline =
+                    beta_hide_delay.map(|delay| tokio::time::Instant::now() + delay);
+                info!("Handle {} launched", lw_handle.id().to_string());
+                let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+                let process_id = lw_handle.id().to_string();
+                let kill_requested = register_kill_sender_with_id(&handle.uuid, process_id.clone(), kill_tx);
+                handle.begin_play_session();
+                handle.set_status(InstanceStatus::Started);
+
+                let loader = handle.to_dto().await.loader;
+                discord_presence::on_instance_start(
+                    instance_name.to_string(),
+                    instance_version.to_string(),
+                    loader.into_owned(),
+                )
+                .await;
+
+                if app_handle.is_some() {
+                    let id = handle.uuid.clone();
+                    if settings_m.open_console_on_launch {
+                        spawn_open_log_window(
+                            app_handle.clone(),
+                            id.to_string(),
+                            instance_name.to_string(),
+                        );
+                    }
+                    push_launcher_message(&id, "Process started").await;
+                }
+
+                let uuid = handle.uuid.clone();
+                let process_id_for_exit = process_id.clone();
+                let h = handle.clone();
+                let inst_name = instance_name.clone();
+                let app_for_show = app_handle.clone();
+                tokio::spawn(async move {
+                    let _shared_guard = shared_guard;
+                    let readiness = wait_for_game_readiness(ready_rx, beta_hide_deadline);
+                    tokio::pin!(readiness);
+                    let mut ready_seen = false;
+                    let result = loop {
+                        tokio::select! {
+                            biased;
+                            Ok(()) = &mut kill_rx => {
+                                info!("Kill signal received for {}", uuid);
+                                if let Err(e) = lw_handle.kill().await {
+                                    warn!("Failed to kill process {}: {:?}", uuid, e);
+                                }
+                                break lw_handle.wait().await;
+                            }
+                            result = lw_handle.wait() => {
+                                info!("Instance {} exited: {:?}", uuid, result);
+                                break result;
+                            }
+                            _ = &mut readiness, if !ready_seen => {
+                                ready_seen = true;
+                                // Окно игры появится сейчас: сообщаем фронту, чтобы погасить индикатор запуска.
+                                crate::core::event_bus::emit(
+                                    crate::core::event_bus::AppEvent::InstanceGameReady {
+                                        id: uuid.to_string().into(),
+                                    },
+                                );
+                                if hide_on_launch {
+                                    session.game_ready();
+                                }
+                            }
+                        }
+                    };
+                    window_watch_stop.store(true, Ordering::Release);
+                    session.process_exited();
+                    unregister_kill_sender_process(&uuid, &process_id_for_exit);
+                    // Release the manager's strong reference and drain the last logs.
+                    // Otherwise its broadcast senders (and forwarding tasks) live forever.
+                    lw.remove(lw_handle.id());
+                    drop(lw_handle);
+                    // Persist the final state before the recreated UI can read it.
+                    h.end_play_session().await;
+                    h.set_status(if has_running_processes(&uuid) { InstanceStatus::Started } else { InstanceStatus::Off });
+                    // Reopen immediately: log draining can take up to two seconds and
+                    // must not delay the launcher. Crash detection still waits for the
+                    // logs below, so `clean_shutdown` is observed before deciding.
+                    session.request_restore();
+                    finish_io_forwarding(io_task).await;
+                    push_launcher_message(&uuid, format!("The process exited: {:?}", result)).await;
+
+                    let crashed = is_unexpected_exit(
+                        result,
+                        kill_requested.load(Ordering::Acquire),
+                        clean_shutdown.load(Ordering::Acquire),
+                    );
+                    if crashed {
+                        let code = result.unwrap_or(-1);
+                        push_launcher_message(&uuid, format!("Crash detected (code {})", code))
+                            .await;
+                        save_crash_log_snapshot(&uuid).await;
+                        emit(AppEvent::InstanceCrashed {
+                            id: uuid.to_compact_string(),
+                            name: inst_name.to_compact_string(),
+                            exit_code: result,
+                            reason: Some(CompactString::new(format!(
+                                "The process exited with code {}",
+                                code
+                            ))),
+                        });
+                        if let Some(app) = app_for_show
+                            && let Err(err) = open_log_window_for_instance(
+                                app,
+                                uuid.to_string(),
+                                inst_name.to_string(),
+                            )
+                            .await
+                        {
+                            warn!("Could not open the logs window: {err}");
+                        }
+                    }
+
+                    discord_presence::on_instance_stop(&inst_name).await;
+                    remove_log_ring(&uuid);
+                    drop(session);
+                });
+            }
+            Err(e) => {
+                window_watch_stop.store(true, Ordering::Release);
+                lw.remove(lw_handle.id());
+                drop(lw_handle);
+                finish_io_forwarding(io_task).await;
+                let msg = e.to_string();
+                error!("{}", msg);
+                push_launcher_message(&handle.uuid, format!("Failed to start: {}", msg)).await;
+                handle.set_status(InstanceStatus::Error(msg.clone()));
+                return Err(AppError::CoreError(crate::core::CoreError::Other(msg)));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Margen de seguridad antes de la expiración del token de Minecraft: por
+/// debajo de esto se refresca, para no arrancar el juego con una sesión que
+/// caduque mientras carga.
+const TOKEN_REFRESH_MARGIN_SECS: i64 = 10 * 60;
+
+/// Refresca el token de Microsoft. Con `force = false` se salta el refresco
+/// cuando el token guardado todavía es válido (el caso normal al lanzar).
+pub(crate) async fn refresh_microsoft_token(
+    mut user: MinecraftUser,
+    force: bool,
+) -> Result<MinecraftUser, AppError> {
+    if user.user_type != AccountType::Microsoft {
+        return Ok(user);
+    }
+
+    // Load the persisted session even if settings currently hold older tokens.
+    if user.load_tokens().is_err() {
+        user.access_token.clear();
+        warn!("Could not load the stored Microsoft access token");
+    }
+
+    // El token de Minecraft vale ~24 h. Si sigue vigente nos ahorramos las cinco
+    // peticiones HTTP encadenadas del refresco (Microsoft → XBL → XSTS → MC),
+    // que eran el mayor coste antes de arrancar el juego.
+    if !force && user.access_token_is_fresh(TOKEN_REFRESH_MARGIN_SECS) {
+        info!("Microsoft token is still valid, skipping refresh");
+        return Ok(user);
+    }
+
+    let Some(refresh_token) = user.refresh_token.clone() else {
+        warn!("No Microsoft refresh token for {}.", user.username);
+        return Err(AppError::Auth(AuthError::SessionExpired(
+            "No refresh token available. Please sign in again.".into(),
+        )));
+    };
+
+    info!("Refreshing Microsoft token...");
+    let refresh_result = tokio::task::spawn_blocking(move || {
+        MicrosoftAuth::default()
+            .refresh_token(&refresh_token)
+    })
+    .await
+    .map_err(|e| AuthError::AuthFailed(e.to_string()))?;
+
+    match refresh_result {
+        Ok(mut new_user) if !new_user.access_token.trim().is_empty()
+            && new_user.uuid.eq_ignore_ascii_case(&user.uuid) => {
+            info!("Token refreshed for {}", new_user.username);
+            new_user.uuid = user.uuid;
+            user = new_user;
+            user.save_tokens()
+                .map_err(|_| AuthError::SaveTokensFailed("Microsoft".into()))?;
+            SettingsManager::write(|settings| {
+                settings.set_user_by_uuid(&user);
+            })?;
+            SettingsManager::save().await?;
+            Ok(user)
+        }
+        _ => {
+            warn!("Could not refresh the Microsoft session for the selected profile");
+            Err(AuthError::SessionExpired("Could not restore the Microsoft session".into()).into())
+        }
+    }
+}
+
+async fn refresh_yggdrasil_token(mut user: MinecraftUser) -> Result<MinecraftUser, AppError> {
+    if user.user_type != AccountType::Yggdrasil {
+        return Ok(user);
+    }
+
+    let server_url = match &user.yggdrasil_server_url {
+        Some(url) => url.clone(),
+        None => {
+            warn!("Yggdrasil server URL not configured, cannot refresh token");
+            return Err(AppError::Auth(AuthError::SessionExpired(
+                "The authentication server address is missing. Please sign in again.".into(),
+            )));
+        }
+    };
+
+    // Load tokens from secure storage
+    if user.load_tokens().is_err() || user.access_token.trim().is_empty() {
+        return Err(AuthError::SessionExpired("Missing Yggdrasil access token".into()).into());
+    }
+
+    let client_token = user
+        .client_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| AuthError::SessionExpired("Missing Yggdrasil client token".into()))?;
+
+    info!("Validating Yggdrasil token...");
+    let auth = YggdrasilAuth::new();
+    match validate_yggdrasil_token(&auth, &server_url, &user.access_token, client_token).await {
+        Ok(true) => {
+            info!("Yggdrasil token is valid");
+            return Ok(user);
+        }
+        Ok(false) => {
+            info!("Yggdrasil server rejected the token, trying to refresh...");
+        }
+        Err(_) => {
+            return Err(DownloadError::Request("Yggdrasil session validation".into()).into());
+        }
+    }
+
+    let refresh_result = auth
+        .refresh(
+            &server_url,
+            &user.access_token,
+            client_token,
+            &user.uuid,
+        )
+        .await;
+
+    match refresh_result {
+        Ok(refreshed) => {
+            info!("Yggdrasil token refreshed for {}", refreshed.username);
+            user = refreshed;
+            user.yggdrasil_server_url = Some(server_url);
+            user.save_tokens()
+                .map_err(|_| AuthError::SaveTokensFailed("Yggdrasil".into()))?;
+            SettingsManager::write(|settings| {
+                settings.set_user_by_uuid(&user);
+            })?;
+            SettingsManager::save().await?;
+            Ok(user)
+        }
+        Err(_) => {
+            warn!("Could not refresh the rejected Yggdrasil session");
+            Err(AuthError::SessionExpired("Could not restore the Yggdrasil session".into()).into())
+        }
+    }
+}
+
+/// Asks the auth server about the token, retrying on network failures.
+/// Returns `Err` only if every attempt failed without a usable answer.
+async fn validate_yggdrasil_token(
+    auth: &YggdrasilAuth,
+    server_url: &str,
+    access_token: &str,
+    client_token: &str,
+) -> Result<bool, String> {
+    const ATTEMPTS: u32 = 3;
+    let mut last_error = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match auth.validate(server_url, access_token, client_token).await {
+            Ok(valid) => return Ok(valid),
+            Err(e) => {
+                warn!("Yggdrasil validation attempt {}/{} failed: {}", attempt, ATTEMPTS, e);
+                last_error = e;
+                if attempt < ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(u64::from(attempt) * 2)).await;
+                }
+            }
+        }
+    }
+    Err(last_error)
+}
+
+fn is_unexpected_exit(exit_code: Option<i32>, kill_requested: bool, clean_shutdown: bool) -> bool {
+    !kill_requested && !clean_shutdown && matches!(exit_code, Some(code) if code != 0)
+}
+
+/// Minecraft registra `Stopping!` cuando el usuario cierra el cliente por su
+/// cuenta (o al salir del mundo). A partir de ahí el apagado es intencional:
+/// aunque el watchdog de apagado del cliente termine el proceso con un código
+/// distinto de cero, no es un crash. Formatos soportados:
+/// `[Render thread/INFO]: Stopping!` y
+/// `[Render thread/INFO] [net.minecraft.client.Minecraft/]: Stopping!`.
+fn is_clean_shutdown(line: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\]:\s*stopping!\s*$").unwrap())
+        .is_match(line)
+}
+
+fn spawn_open_log_window(
+    app: Option<tauri::AppHandle>,
+    instance_id: String,
+    instance_name: String,
+) {
+    if let Some(app) = app {
+        tokio::spawn(async move {
+            if let Err(err) = open_log_window_for_instance(app, instance_id, instance_name).await {
+                warn!("Could not open the logs window: {}", err);
+            }
+        });
+    }
+}
+
+// PolyMC's LauncherPartLaunch uses this message to close its UI once Minecraft
+// has reached client initialization, rather than merely after Java was spawned.
+fn is_game_ready(line: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\bsetting user(?::|\s)\s*\S+").unwrap())
+        .is_match(line)
+}
+
+/// Old Minecraft betas may never print the modern client-ready marker. Use the
+/// base version ID (including inherited/modded profiles), not the launcher version.
+fn beta_readiness_delay(
+    version: &str,
+    parent: Option<&str>,
+    hide_on_launch: bool,
+) -> Option<std::time::Duration> {
+    if !hide_on_launch {
+        return None;
+    }
+    let base = GameVersion::from_version_id(parent.unwrap_or(version)).mc_version;
+    let beta = base
+        .strip_prefix('b')
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(major, minor)| {
+            !major.is_empty()
+                && major.bytes().all(|byte| byte.is_ascii_digit())
+                && minor.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        });
+    beta.then_some(std::time::Duration::from_secs(2))
+}
+
+async fn wait_for_game_readiness(
+    mut marker: tokio::sync::oneshot::Receiver<()>,
+    beta_deadline: Option<tokio::time::Instant>,
+) {
+    let fallback = async {
+        match beta_deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(fallback);
+    tokio::select! {
+        result = &mut marker => {
+            // Closing stdout/stderr is not a readiness signal. Betas may run
+            // without either stream; other versions must still wait for a marker.
+            if result.is_err() {
+                fallback.await;
+            }
+        }
+        _ = &mut fallback => {}
+    }
+    // The log marker appears before the game window is actually shown. Hiding the
+    // launcher right away left a gap with no visible window, so wait a bit longer.
+    tokio::time::sleep(GAME_WINDOW_GRACE).await;
+    // The supervisor prioritizes kill/exit over this future and drops it on exit,
+    // so the timer cannot hide the launcher after a failed/terminated session.
+}
+
+/// Пауза между маркером готовности Minecraft и скрытием лаунчера, чтобы окно игры успело появиться.
+const GAME_WINDOW_GRACE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+#[derive(Default)]
+struct PendingLogs {
+    lines: Vec<LogEntryEvent>,
+    preview: Option<LogEntryEvent>,
+}
+
+impl PendingLogs {
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.preview.is_none()
+    }
+
+    fn push(&mut self, entry: LogEntryEvent, console: bool, preview: bool) {
+        if preview {
+            self.preview = Some(entry.clone());
+        } else {
+            self.preview = None;
+        }
+        if console {
+            self.lines.push(entry);
+        } else {
+            self.lines.clear();
+        }
+    }
+}
+
+fn log_consumers(app: Option<&tauri::AppHandle>, id: &str, log_label: &str) -> (bool, bool) {
+    app.map_or((false, false), |app| {
+        (
+            app.get_webview_window(log_label).is_some(),
+            wants_log_preview(id) && app.get_webview_window("main").is_some(),
+        )
+    })
+}
+
+fn flush_log_batch(
+    app: Option<&tauri::AppHandle>,
+    id: &str,
+    log_label: &str,
+    batch: &mut Vec<LogEntryEvent>,
+) {
+    if !batch.is_empty()
+        && let Some(app) = app
+        && app.get_webview_window(log_label).is_some()
+    {
+        let _ = app.emit_to(
+            EventTarget::webview_window(log_label),
+            "instance-log-batch",
+            LogBatchEvent { id, lines: batch },
+        );
+    }
+    // Keep the allocation for the next batch.
+    batch.clear();
+}
+
+fn flush_log_preview(
+    app: Option<&tauri::AppHandle>,
+    id: &str,
+    preview: &mut Option<LogEntryEvent>,
+) {
+    #[derive(Clone, serde::Serialize)]
+    struct Preview<'a> {
+        id: &'a str,
+        line: &'a str,
+    }
+    if let Some(line) = preview.take()
+        && let Some(app) = app
+        && wants_log_preview(id)
+        && let Some(window) = app.get_webview_window("main")
+        && window.is_visible().unwrap_or(false)
+        && !window.is_minimized().unwrap_or(false)
+    {
+        let _ = app.emit_to(
+            EventTarget::webview_window("main"),
+            "instance-log-preview",
+            Preview {
+                id,
+                line: &line.line,
+            },
+        );
+    }
+}
+
+fn spawn_io_forwarding(
+    app: Option<tauri::AppHandle>,
+    id: Arc<str>,
+    mut stdout: broadcast::Receiver<String>,
+    mut stderr: broadcast::Receiver<String>,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+    clean_shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let ring = get_log_ring(&id);
+        let log_label = format!("log-{id}");
+        let mut pending = PendingLogs::default();
+        let mut stdout_closed = false;
+        let mut stderr_closed = false;
+        let delay = std::time::Duration::from_millis(80);
+        let timer = tokio::time::sleep(delay);
+        tokio::pin!(timer);
+
+        while !stdout_closed || !stderr_closed {
+            let (line_result, is_stderr) = tokio::select! {
+                line = stdout.recv(), if !stdout_closed => (line, false),
+                line = stderr.recv(), if !stderr_closed => (line, true),
+                _ = &mut timer, if !pending.is_empty() => {
+                    flush_log_batch(app.as_ref(), &id, &log_label, &mut pending.lines);
+                    flush_log_preview(app.as_ref(), &id, &mut pending.preview);
+                    continue;
+                }
+            };
+            let line = match line_result {
+                Ok(line) => line,
+                Err(broadcast::error::RecvError::Lagged(count)) => {
+                    warn!("{count} log lines from {id} were lost");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    if is_stderr {
+                        stderr_closed = true;
+                    } else {
+                        stdout_closed = true;
+                    }
+                    continue;
+                }
+            };
+            let stripped = strip_ansi(&line);
+            if ready.is_some()
+                && is_game_ready(&stripped)
+                && let Some(tx) = ready.take()
+            {
+                let _ = tx.send(());
+            }
+            let cleaned = sanitize_with_user(&stripped);
+            if cleaned.is_empty() {
+                continue;
+            }
+            if is_clean_shutdown(&cleaned) {
+                clean_shutdown.store(true, Ordering::Release);
+            }
+            let level = LogLevel::from_line(&cleaned, is_stderr);
+            let text: Arc<str> = Arc::from(cleaned);
+            let (line_id, timestamp) = ring.push(text.clone(), level, u8::from(is_stderr)).await;
+            // Retain sanitized history while the WebView is gone, without building
+            // IPC payloads or waking an interval timer for an absent frontend.
+            let (console, preview) = log_consumers(app.as_ref(), &id, &log_label);
+            if console || preview {
+                if pending.is_empty() {
+                    timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                }
+                pending.push(
+                    LogEntryEvent {
+                        id: line_id,
+                        line: text,
+                        stream: if is_stderr { "stderr" } else { "stdout" },
+                        level,
+                        timestamp,
+                    },
+                    console,
+                    preview,
+                );
+                if pending.lines.len() >= 64 {
+                    // Console throughput must not increase header updates above
+                    // one preview per 80 ms. Its last line waits for the timer.
+                    flush_log_batch(app.as_ref(), &id, &log_label, &mut pending.lines);
+                }
+            } else {
+                pending.lines.clear();
+                pending.preview = None;
+            }
+        }
+        flush_log_batch(app.as_ref(), &id, &log_label, &mut pending.lines);
+        flush_log_preview(app.as_ref(), &id, &mut pending.preview);
+    })
+}
+
+async fn finish_io_forwarding(mut task: tokio::task::JoinHandle<()>) {
+    // A mod can leave a child process holding stdout/stderr open after Java exits.
+    // Bound the drain time so that it cannot prevent the launcher from returning.
+    match tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!("Error processing game logs: {err}"),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            warn!("Timed out waiting for the game logs to close");
+        }
+    }
+}
+
+/// Returns true if the Forge version indicates a version >= 36.2.26
+/// (which bundles ModLauncher 8.1.3+ with the fixed ManifestEntryVerifier).
+/// Note: `forge_ver` is just the forge version string (e.g. "14.22.1.2485"),
+/// extracted by `Loader::from_version_id()`.
+fn is_forge_version_safe(forge_ver: &str) -> bool {
+    let parts: Vec<u32> = forge_ver
+        .split('.')
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let safe = match parts.as_slice() {
+        [major, minor, patch, ..] => (*major, *minor, *patch) >= (36, 2, 26),
+        _ => false,
+    };
+    debug!("Forge version safety check: forge_ver={forge_ver}, parts={parts:?}, safe={safe}");
+    safe
+}
+
+fn resolve_java_path(
+    settings: &SettingsSnapshot,
+    java_version: Option<&launchwerk::models::JavaVersion>,
+) -> (u8, std::path::PathBuf) {
+    let version = match java_version {
+        Some(v) => v.major_version,
+        None => 25,
+    };
+    match version {
+        8 if settings.jre8_managed && JavaManager::is_installed(8) => {
+            (8, JavaManager::get_java_binary(8))
+        }
+        17 if settings.jre17_managed && JavaManager::is_installed(17) => {
+            (17, JavaManager::get_java_binary(17))
+        }
+        21 if settings.jre21_managed && JavaManager::is_installed(21) => {
+            (21, JavaManager::get_java_binary(21))
+        }
+        25 if settings.jre25_managed && JavaManager::is_installed(25) => {
+            (25, JavaManager::get_java_binary(25))
+        }
+        8 => (8, settings.get_jre8_path().to_path_buf()),
+        17 => (17, settings.get_jre17_path().to_path_buf()),
+        21 => (21, settings.get_jre21_path().to_path_buf()),
+        25 => (25, settings.get_jre25_path().to_path_buf()),
+        _ => {
+            if settings.jre21_managed && JavaManager::is_installed(21) {
+                (21, JavaManager::get_java_binary(21))
+            } else {
+                (21, settings.get_jre21_path().to_path_buf())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/services/launcher.rs"]
+mod tests;

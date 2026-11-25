@@ -1,0 +1,21 @@
+[package]
+name = "zellkern"
+version = "0.1.0"
+edition = "2024"
+description = "Minecraft version, loader and launch data library for moonlauncher"
+authors = ["Santiagolxx", "moonlauncher contributors"]
+license = "GPL-3.0-only"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+uuid = { version = "1", features = ["v4"] }
+md5 = "0.8"
+zip = "9.0.5"
+cap-std = "3"
+cap-primitives = "3.4"
+
+[dev-dependencies]
+tempfile = "3"

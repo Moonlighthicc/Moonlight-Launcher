@@ -1,0 +1,739 @@
+import type { NotificationPreferences } from "$lib/components/ui/notificationPreferences";
+import type { InterfacePreferences } from "$lib/utils/interfacePreferences";
+
+export interface InstanceDto {
+	name: string;
+	version: string;
+	loader: string;
+	last_played: number;
+	playtime_seconds: number;
+	status: InstState;
+	cover_image: string | null;
+	icon: string | null;
+	uuid: string;
+	path: string;
+	overrides: InstOverrides | null;
+	pinned: boolean;
+	/** Perfil global de options.txt asignado a la instancia. */
+	options_profile_id: string | null;
+	/** Si el perfil se aplica automáticamente antes de lanzar. */
+	auto_apply_options: boolean;
+	/** Momento de creación (segundos Unix); 0 en instancias anteriores a este campo. */
+	created_at: number;
+}
+
+export interface InstOverrides {
+	javaVersion: number | null;
+	memory: MemOverrides | null;
+	/** Argumentos JVM propios de la instancia (estilo MultiMC/Prism). */
+	jvmArgs?: string[] | null;
+}
+
+export interface MemOverrides {
+	minMem: number;
+	maxMem: number;
+}
+export enum InstState {
+	Started = "started",
+	Error = "error",
+	Starting = "starting",
+	Off = "off",
+}
+
+export interface ModDto {
+	version_id?: string | null;
+	pack_name?: string | null;
+	pack_locked?: boolean;
+	pack_modified?: boolean;
+	icon_revision?: string;
+	name: string;
+	filename: string;
+	version: string | null;
+	description: string | null;
+	authors: string[] | null;
+	icon: string | null;
+	enabled: boolean;
+	sha1: string;
+	file_size: number;
+	source: string;
+	project_id: string | null;
+	slug: string | null;
+}
+export interface InstancesPollingPayload {
+	running: string[];
+	all: InstanceDto[];
+	count: number;
+}
+
+export interface Settings {
+	user: MinecraftUser[];
+	active_user_idx: number;
+	min_memory: number;
+	max_memory: number;
+	use_recommended_ram: boolean;
+	jre8_path: string;
+	jre8_managed: boolean;
+	/** Proveedor de JRE de cada versión de Java; "auto" usa la cadena por defecto. */
+	jre8_vendor: string;
+	jre17_path: string;
+	jre17_managed: boolean;
+	jre17_vendor: string;
+	jre21_path: string;
+	jre21_managed: boolean;
+	jre21_vendor: string;
+	jre25_path: string;
+	jre25_managed: boolean;
+	jre25_vendor: string;
+	language: string;
+	auto_updates: boolean;
+	update_channel: string;
+	close_launcher_on_play: boolean;
+	hide_on_launch: boolean;
+	restore_last_instance: boolean;
+	open_console_on_launch: boolean;
+	console_history_limit: number;
+	console_show_level_tags: boolean;
+	show_snapshots: boolean;
+	show_alpha: boolean;
+	show_unstable_loaders: boolean;
+	jvm_args: string;
+	env_vars: Record<string, string>;
+	theme: string;
+	discord_presence: boolean;
+	show_tutorial: boolean;
+	license_accepted: boolean;
+	market_filter_collapsed: boolean;
+	prominent_notifications: boolean;
+	notification_preferences: NotificationPreferences | null;
+	interface_preferences: InterfacePreferences;
+	reduce_animations: boolean;
+	disable_blur_effects: boolean;
+	disable_infinite_animations: boolean;
+	disable_skin3d_animations: boolean;
+	reduce_log_animations: boolean;
+	disable_background_image: boolean;
+	reduce_skin3d_quality: boolean;
+	/** Proveedor de descargas: "official" (Mojang) o "bmclapi" (espejo China). */
+	download_provider: string;
+	/** Tamaño del campo de cintas de los mosaicos, % (30–100; 80 = original). */
+	tile_slider_size: number;
+	/** Vertical scale of the tile slider area, % (80 = original). */
+	tile_slider_size_y: number;
+	/** Inset from the outer edges of animated tile sliders, in pixels. */
+	tile_slider_edge_inset: number;
+	/** Velocidad de las cintas, % (10–200; 80 = original). */
+	tile_slider_speed: number;
+	/** Extensión vertical del campo de cintas, % (0–100; 0 = sin extender). */
+	tile_slider_height: number;
+	/** Режим вертикальной компоновки поля слайдеров. */
+	tile_slider_layout: "size" | "stretch" | "custom";
+	/** Количество строк в пользовательском режиме (1–10). */
+	tile_slider_rows: number;
+	/** Граница затухания краёв полосы, % (30–100; 50 = как раньше). */
+	tile_slider_border: number;
+	/** Расстояние между элементами в статической сетке, px. */
+	tile_slider_grid_gap: number;
+	/** Расстояние между элементами бегущей ленты, px. */
+	tile_slider_gap: number;
+	/** Скрывать подписи у движущихся слайдеров. */
+	tile_slider_hide_text: boolean;
+	/** Segundos entre capturas de la galería (0 = desactivado). */
+	screenshot_interval: number;
+	/** Стиль плиток. */
+	tile_style: TileStyle;
+	/** Сторона текста плитки. */
+	tile_side: TileSide;
+	/** Положение текста в стиле «Стильный». */
+	tile_text_pos: TileTextPos;
+	/** Размытие стеклянной подложки, % (0–80). */
+	/** Legacy persisted key; now controls the glass panel blur. */
+	tile_centered_blur: number;
+}
+
+export type TileStyle = "standard" | "stylish" | "glass";
+export type TileSide = "auto" | "left" | "right";
+export type TileTextPos =
+	| "auto"
+	| "bottom-left"
+	| "bottom-center"
+	| "bottom-right"
+	| "top-left"
+	| "top-center"
+	| "top-right";
+
+export interface JreStatus {
+	version: number;
+	installed: boolean;
+	java_version: string | null;
+	/** Identificador del proveedor detectado en el runtime instalado. */
+	vendor?: string | null;
+}
+
+export type AccountType = "Cracked" | "Microsoft" | "Yggdrasil";
+
+export interface MinecraftUser {
+	username: string;
+	uuid: string;
+	access_token: string;
+	refresh_token: string | null;
+	user_type: AccountType;
+	yggdrasil_server_url?: string | null;
+}
+
+export interface YggdrasilServerInfo {
+	server_name: string;
+	skin_domains: string[];
+	non_email_login: boolean;
+}
+
+export interface MinecraftProfileSkin {
+	id: string;
+	state: string;
+	url: string;
+	variant: string;
+	alias: string;
+}
+
+export interface ElySkinProfile {
+	skin_url: string | null;
+	model: "classic" | "slim";
+}
+
+export interface YggdrasilSkinProfile {
+	skin_url: string | null;
+	model: "classic" | "slim";
+}
+
+export interface MinecraftProfileCape {
+	id: string;
+	url: string;
+	alias: string;
+	state: string;
+}
+
+export interface MinecraftProfileResponse {
+	id: string;
+	name: string;
+	skins: MinecraftProfileSkin[];
+	capes: MinecraftProfileCape[];
+	profileActions: string[];
+}
+
+export interface SkinClosetEntry {
+	id: string;
+	url: string;
+	local_path: string;
+	variant: string;
+	alias: string;
+	saved_at: number;
+}
+
+export interface JreInstallPrompt {
+	version: number;
+	instance: InstanceDto;
+	serverAddress?: string;
+}
+
+export interface PendingJreLaunch {
+	version: number;
+	instance: InstanceDto;
+	serverAddress?: string;
+}
+
+export interface DeviceCode {
+	user_code: string;
+	device_code: string;
+	verification_uri: string;
+	expires_in: number;
+	interval: number;
+}
+
+export type NotificationType = "error" | "info" | "success" | "warning";
+
+export interface Notification {
+	id: string;
+	type: NotificationType;
+	title: string;
+	message: string;
+	timeout?: number;
+	progress?: number;
+	totalMb?: number;
+}
+
+export interface McVersion {
+	loader: "vanilla" | "fabric" | "forge" | "neoforge" | "quilt" | "optifine";
+	version: string;
+	type: string;
+}
+
+export interface MinecraftVersion {
+	id: string;
+	type: string;
+	url: string;
+	time: string;
+	releaseTime: string;
+}
+
+export interface FabricGameVersion {
+	version: string;
+	stable: boolean;
+}
+
+export interface LoaderVersion {
+	version: string;
+	stable: boolean;
+}
+
+export interface ForgeGameVersion {
+	version_id: string;
+	game_version: string;
+	forge_version: string;
+	stable: boolean;
+}
+
+export interface OptiFineVersion {
+	version_id: string;
+	game_version: string;
+	optifine_version: string;
+	filename: string;
+	stable: boolean;
+}
+
+export interface NeoForgeGameVersion {
+	version_id: string;
+	game_version: string;
+	neoforge_version: string;
+	stable: boolean;
+}
+
+/** Loader cuyo catálogo agrupa y ordena Rust. */
+export type LoaderCatalogLoader = "forge" | "neoforge" | "optifine";
+
+export interface LoaderDisplayVersion {
+	version_id: string;
+	display_version: string;
+	game_version: string;
+	stable: boolean;
+}
+
+export interface LoaderVersionGroup {
+	game_version: string;
+	has_stable: boolean;
+	versions: LoaderDisplayVersion[];
+}
+
+export interface LoaderVersionCatalog {
+	games: LoaderVersionGroup[];
+}
+
+export type AppEvent =
+	| {
+			type: "InstanceGameReady";
+			data: {
+				id: string;
+			};
+	  }
+	| {
+			type: "InstanceProcessesChanged";
+			data: {
+				id: string;
+				process_ids: string[];
+			};
+	  }
+	| {
+			type: "InstanceStarted";
+			data: {
+				id: string;
+			};
+	  }
+	| {
+			type: "InstanceDeleted";
+			data: {
+				id: string;
+			};
+	  }
+	| {
+			type: "InstanceEdited";
+			data: {
+				id: string;
+				dto?: InstanceDto;
+			};
+	  }
+	| {
+			type: "InstanceCreated";
+			data: {
+				id: string;
+				dto: InstanceDto;
+			};
+	  }
+	| {
+			type: "InstanceCrashed";
+			data: {
+				id: string;
+				name: string;
+				exit_code: number | null;
+				reason: string | null;
+			};
+	  }
+	| {
+			type: "DProgress";
+			data: {
+				version: string;
+				stage: string;
+				item_current: number;
+				item_total: number;
+				bytes_current: number;
+				bytes_total: number;
+				current_item: string | null;
+			};
+	  }
+	| {
+			type: "DStage";
+			data: {
+				version: string;
+				stage: string;
+				info: string | null;
+			};
+	  }
+	| {
+			type: "DFinish";
+			data: {
+				version: string;
+			};
+	  }
+	| {
+			type: "DError";
+			data: {
+				version: string;
+				message: string;
+			};
+	  }
+	| {
+			type: "DEnqueue";
+			data: {
+				version: string;
+				cancellable?: boolean;
+			};
+	  }
+	| {
+			type: "DCancel";
+			data: {
+				version: string;
+			};
+	  }
+	| {
+			type: "JREChanged";
+	  }
+	| {
+			type: "STChanged";
+	  }
+	| {
+			type: "ThemeChanged";
+			data: {
+				id: string;
+			};
+	  }
+	| {
+			type: "ModsEnriched";
+			data: {
+				id: string;
+			};
+	  }
+	| {
+			type: "ResourcepacksEnriched";
+			data: {
+				id: string;
+			};
+	  }
+	| {
+			type: "ShaderpacksEnriched";
+			data: {
+				id: string;
+			};
+	  };
+
+export interface ConsoleOutputPayload {
+	id: string;
+	line: string;
+	stream: "stdout" | "stderr";
+}
+
+export interface ThemePreview {
+	bg: string;
+	accent: string;
+	text: string;
+}
+
+export interface ThemeEntry {
+	id: string;
+	name: string;
+	author: string;
+	version: string;
+	type: string;
+	preview?: ThemePreview | null;
+	icon?: string | null;
+}
+
+export interface ModrinthFile {
+	hashes?: Record<string, string>;
+	url: string;
+	filename: string;
+	primary: boolean;
+}
+
+export interface ModrinthDependency {
+	dependency_type: string;
+	project_id: string | null;
+	version_id: string | null;
+}
+
+export interface ModrinthVersion {
+	version_type?: "release" | "beta" | "alpha";
+	id: string;
+	name: string;
+	version_number: string;
+	game_versions: string[];
+	loaders: string[];
+	date_published: string;
+	files: ModrinthFile[];
+	dependencies: ModrinthDependency[];
+}
+
+export interface ModrinthProject {
+	project_id: string;
+	slug: string;
+	author: string;
+	title: string;
+	description: string;
+	categories: string[];
+	versions: string[];
+	downloads: number;
+	icon_url: string | null;
+}
+
+export interface ModrinthSearchResult {
+	hits: ModrinthProject[];
+	offset: number;
+	limit: number;
+	total_hits: number;
+}
+
+export type ModSource = "modrinth" | "curseforge";
+
+export interface ModrinthVersionFileFull {
+	filename: string;
+	url: string;
+	primary: boolean;
+	hashes: Record<string, string>;
+	size: number;
+}
+
+export interface ModrinthVersionFull {
+	id: string;
+	name: string;
+	version_number: string;
+	game_versions: string[];
+	loaders: string[];
+	date_published: string;
+	files: ModrinthVersionFileFull[];
+	dependencies: ModrinthDependency[];
+	version_type: string;
+}
+
+export interface ModrinthProjectFull {
+	id: string;
+	slug: string;
+	project_type: string;
+	title: string;
+	description: string;
+	body: string | null;
+	icon_url: string | null;
+	versions: string[];
+	game_versions: string[];
+	loaders: string[];
+	categories: string[];
+	gallery?: { url: string; raw_url?: string; title?: string | null; description?: string | null }[];
+	client_side: string;
+	server_side: string;
+	issues_url?: string | null;
+	source_url?: string | null;
+	wiki_url?: string | null;
+	discord_url?: string | null;
+	license?: {
+		id: string;
+		name: string;
+		url?: string | null;
+	} | null;
+	downloads: number;
+	follows: number;
+	date_created: string;
+	date_modified: string;
+}
+
+export interface ModFileSource {
+	project_id: string;
+	version_id: string;
+	filename: string;
+}
+
+export interface ModUpdateInfo {
+	filename: string;
+	projectTitle: string;
+	iconUrl: string | null;
+	currentVersion: string;
+	latestVersion: string | null;
+	latestVersionId: string | null;
+	upToDate: boolean;
+	modrinthSource: ModFileSource;
+}
+
+export interface InstanceModsMetadata {
+	mods: ModFileSource[];
+}
+
+export interface CurseForgeAuthor {
+	name: string;
+}
+
+export interface CurseForgeLogo {
+	id: number;
+	modId?: number;
+	url: string;
+	thumbnailUrl?: string;
+}
+
+export interface CurseForgeCategory {
+	id: number;
+	gameId?: number;
+	name: string;
+	slug: string;
+	url?: string;
+	iconUrl?: string;
+}
+
+export interface CurseForgeProject {
+	id: number;
+	name: string;
+	slug: string;
+	links?: {
+		websiteUrl?: string | null;
+		wikiUrl?: string | null;
+		issuesUrl?: string | null;
+		sourceUrl?: string | null;
+	} | null;
+	summary: string;
+	logo: CurseForgeLogo | null;
+	screenshots?: { url: string; thumbnailUrl?: string; title?: string; description?: string }[];
+	categories: CurseForgeCategory[];
+	authors: CurseForgeAuthor[];
+	downloadCount: number;
+	gameId?: number;
+	dateCreated: string;
+	dateModified: string;
+	isAvailable: boolean;
+	mainFileId?: number;
+	latestFiles: CurseForgeFile[];
+	latestFilesIndexes: {
+		gameVersion: string;
+		fileId: number;
+		filename: string;
+		releaseType: number;
+		modLoader?: number | null;
+	}[];
+}
+
+export interface CurseForgeSearchResult {
+	data: CurseForgeProject[];
+	pagination: {
+		index: number;
+		pageSize: number;
+		resultCount: number;
+		totalCount: number;
+	};
+}
+
+export interface CurseForgeFileDependency {
+	modId?: number;
+	relationType: number;
+}
+
+export interface CurseForgeFile {
+	hashes?: { value: string; algo: number }[];
+	id: number;
+	modId?: number;
+	fileName: string;
+	displayName?: string;
+	isServerPack?: boolean;
+	fileDate: string;
+	downloadUrl: string | null;
+	fileLength: number;
+	gameVersions: string[];
+	modLoaders?: (string | number)[] | null;
+	sortableGameVersions?: { gameVersion: string; gameVersionName?: string }[] | null;
+	isAvailable: boolean;
+	releaseType: number;
+	dependencies: CurseForgeFileDependency[];
+}
+
+export interface CurseForgeFilesResult {
+	data: CurseForgeFile[];
+	pagination: {
+		index: number;
+		pageSize: number;
+		resultCount: number;
+		totalCount: number;
+	};
+}
+
+export interface CurseForgeModLoader {
+	id: number;
+	name: string;
+	slug: string;
+}
+
+export interface MrpackInfo {
+	author?: string | null;
+	name: string;
+	version_id: string;
+	summary: string | null;
+	minecraft_version: string | null;
+	loader: string | null;
+	loader_version: string | null;
+	file_count: number;
+	version_id_for_instance?: string | null;
+	icon: string | null;
+}
+
+export interface InstanceImportPlan {
+	format_id: string;
+	format_name: string;
+	original_name: string;
+	sanitized_name: string;
+	minecraft_version: string | null;
+	loader: string | null;
+	loader_version: string | null;
+	warnings: string[];
+	preview_token: string;
+}
+
+export interface CurseForgeGameVersion {
+	id: number;
+	name: string;
+	slug: string;
+}
+
+export interface CurseForgeModpackInfo {
+	name: string;
+	version: string;
+	summary: string | null;
+	minecraft_version: string | null;
+	loader: string | null;
+	loader_version: string | null;
+	file_count: number;
+	version_id_for_instance?: string | null;
+	icon: string | null;
+}
+
+export type LocalModpackInfo =
+	| { format: "modrinth"; info: MrpackInfo }
+	| { format: "curseforge"; info: CurseForgeModpackInfo };

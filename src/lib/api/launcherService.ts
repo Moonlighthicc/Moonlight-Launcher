@@ -1,0 +1,427 @@
+import {
+	launcherStore,
+	showErrorParsed,
+	clearPendingJreLaunch,
+} from "../state/state.svelte";
+
+export type RefreshLocalCallback = () => void;
+const _refreshCallbacks = new Map<string, Set<RefreshLocalCallback>>();
+
+export function refreshInstanceMods(instanceId: string): void {
+	for (const callback of _refreshCallbacks.get(instanceId) ?? []) callback();
+}
+
+export function registerModsRefreshCallback(
+	instanceId: string,
+	cb: RefreshLocalCallback,
+): () => void {
+	let callbacks = _refreshCallbacks.get(instanceId);
+	if (!callbacks) {
+		callbacks = new Set();
+		_refreshCallbacks.set(instanceId, callbacks);
+	}
+	callbacks.add(cb);
+	return () => {
+		callbacks.delete(cb);
+		if (callbacks.size === 0) _refreshCallbacks.delete(instanceId);
+	};
+}
+
+/** Pub/sub para que componentes escuchen eventos Tauri sin registrar su propio listener */
+const _eventSubs = new Map<
+	string,
+	Set<(payload: Record<string, unknown>) => void>
+>();
+
+export function onAppEvent(
+	type: string,
+	handler: (payload: Record<string, unknown>) => void,
+): () => void {
+	let handlers = _eventSubs.get(type);
+	if (!handlers) {
+		handlers = new Set();
+		_eventSubs.set(type, handlers);
+	}
+	handlers.add(handler);
+	return () => {
+		handlers.delete(handler);
+		if (handlers.size === 0) _eventSubs.delete(type);
+	};
+}
+
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { markGameReady } from "$lib/state/gameReadyState.svelte";
+import type {
+	AppEvent,
+	InstanceDto,
+	InstOverrides,
+	MinecraftUser,
+} from "../types/types";
+import {
+	killInstance,
+	getSettings,
+	updateSettings,
+	launchInstance,
+} from "./cubicApi";
+import { applyTheme } from "./themeManager";
+import { createSaveQueue } from "$lib/utils/saveQueue";
+import {
+	initDownloadState,
+	destroyDownloadState,
+} from "$lib/state/downloadState.svelte";
+import {
+	initDownloadQueueState,
+	destroyDownloadQueueState,
+} from "$lib/state/downloadQueueState.svelte";
+
+import { invoke } from "@tauri-apps/api/core";
+import { loadInstalledVersions } from "$lib/state/versionsState.svelte";
+
+export function getActiveUser(): MinecraftUser | null {
+	const users = launcherStore.settings.user;
+	const idx = launcherStore.settings.active_user_idx;
+	if (users.length > 0 && idx >= 0 && idx < users.length) {
+		return users[idx];
+	}
+	return null;
+}
+
+/** Debounce "trailing" con límite máximo de espera (`maxWait`).
+ *  Ejecuta `fn` después de `wait` ms de silencio, pero forzará la ejecución
+ *  si transcurren `maxWait` ms desde el primer disparo. Incluye `cancel()`. */
+function createDebounce(fn: () => void, wait: number, maxWait: number) {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let maxTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const clearAll = () => {
+		clearTimeout(timer);
+		clearTimeout(maxTimer);
+		timer = undefined;
+		maxTimer = undefined;
+	};
+
+	const run = () => {
+		clearTimeout(timer);
+		timer = setTimeout(() => {
+			clearAll();
+			fn();
+		}, wait);
+
+		if (!maxTimer) {
+			maxTimer = setTimeout(() => {
+				clearAll();
+				fn();
+			}, maxWait);
+		}
+	};
+
+	run.cancel = clearAll;
+	return run;
+}
+
+let _listenerInitialized = false;
+let _unlistenAppEvent: Promise<UnlistenFn> | null = null;
+const _debouncedGetVersions = createDebounce(getVersions, 80, 300);
+const _debouncedSyncSettings = createDebounce(syncSettings, 60, 250);
+let _localSettingsChange = false;
+let _settingsRevision = 0;
+let _instancesRevision = 0;
+let _instancesRequest = 0;
+const _deletedInstances = new Set<string>();
+const settingsSaveQueue = createSaveQueue(persistSettings);
+
+export function markLocalSettingsChange(): void {
+	_localSettingsChange = true;
+	_settingsRevision++;
+}
+
+export function initEventListeners(mode: "main" | "logs" = "main"): void {
+	if (_listenerInitialized) return;
+	_listenerInitialized = true;
+
+	if (mode === "main") {
+		initDownloadState();
+		initDownloadQueueState();
+	}
+
+	_unlistenAppEvent = listen<AppEvent>("app-event", (event) => {
+		const payload = event.payload;
+		// Auxiliary consoles only need live appearance/settings updates.
+		if (
+			mode === "logs" &&
+			payload.type !== "STChanged" &&
+			payload.type !== "ThemeChanged"
+		)
+			return;
+
+		switch (payload.type) {
+			case "InstanceGameReady":
+				markGameReady(payload.data.id);
+				break;
+			case "InstanceCreated":
+				_instancesRevision++;
+				if (_deletedInstances.has(payload.data.id)) break;
+				if (
+					launcherStore.loadedInstances.some(
+						(i) => i.uuid === payload.data.id,
+					)
+				) {
+					updateInstanceInStore(payload.data.dto);
+					break;
+				}
+				launcherStore.loadedInstances.push(payload.data.dto);
+				sortInstances(launcherStore.loadedInstances);
+				break;
+			case "InstanceEdited": {
+				_instancesRevision++;
+				if (_deletedInstances.has(payload.data.id)) break;
+				const dto = payload.data.dto;
+				if (dto) {
+					_debouncedGetVersions.cancel();
+					updateInstanceInStore(dto);
+				} else {
+					_debouncedGetVersions();
+				}
+				refreshInstanceMods(payload.data.id);
+				break;
+			}
+			case "InstanceDeleted":
+				removeDeletedInstance(payload.data.id);
+				break;
+			case "DFinish": {
+				// Keep installed versions current even before the downloader is opened.
+				void loadInstalledVersions(true);
+				const pending = launcherStore.pendingJreLaunch;
+				if (pending) {
+					const jreVersionStr = `jre-${pending.version}`;
+					if (payload.data.version === jreVersionStr) {
+						handleJreInstalled(
+							pending.version,
+							pending.instance,
+							pending.serverAddress,
+						);
+					}
+				}
+				break;
+			}
+			case "DCancel":
+			case "DError": {
+				const pending = launcherStore.pendingJreLaunch;
+				if (pending) {
+					const jreVersionStr = `jre-${pending.version}`;
+					if (payload.data.version === jreVersionStr) {
+						clearPendingJreLaunch();
+					}
+				}
+				break;
+			}
+			case "STChanged":
+				_debouncedSyncSettings();
+				break;
+			case "ThemeChanged":
+				if (payload.data.id === launcherStore.settings.theme) {
+					applyTheme(payload.data.id, { force: true });
+				}
+				break;
+			case "ModsEnriched":
+			case "ResourcepacksEnriched":
+			case "ShaderpacksEnriched": {
+				const callbacks = _refreshCallbacks.get(payload.data.id);
+				if (callbacks) {
+					for (const cb of callbacks) cb();
+				}
+				break;
+			}
+		}
+
+		const subs = _eventSubs.get(payload.type);
+		if (subs) {
+			for (const handler of subs) handler(payload);
+		}
+	});
+}
+
+/** Libera event listeners y timers — llamar en onDestroy */
+export function destroyEventListeners(): void {
+	_instancesRequest++;
+	_debouncedGetVersions.cancel();
+	_debouncedSyncSettings.cancel();
+	if (_unlistenAppEvent) {
+		_unlistenAppEvent.then((u) => u()).catch(() => {});
+		_unlistenAppEvent = null;
+	}
+	destroyDownloadState();
+	destroyDownloadQueueState();
+	_refreshCallbacks.clear();
+	_listenerInitialized = false;
+}
+
+async function handleJreInstalled(
+	version: number,
+	instance: InstanceDto,
+	serverAddress?: string,
+) {
+	if (version === 8 && !launcherStore.settings.jre8_managed) {
+		launcherStore.settings.jre8_managed = true;
+		await updateSettings(launcherStore.settings);
+	} else if (version === 17 && !launcherStore.settings.jre17_managed) {
+		launcherStore.settings.jre17_managed = true;
+		await updateSettings(launcherStore.settings);
+	} else if (version === 21 && !launcherStore.settings.jre21_managed) {
+		launcherStore.settings.jre21_managed = true;
+		await updateSettings(launcherStore.settings);
+	} else if (version === 25 && !launcherStore.settings.jre25_managed) {
+		launcherStore.settings.jre25_managed = true;
+		await updateSettings(launcherStore.settings);
+	}
+
+	clearPendingJreLaunch();
+	await launchInstance(instance, undefined, undefined, serverAddress);
+}
+
+export async function syncSettings(): Promise<void> {
+	if (settingsSaveQueue.busy) return;
+	if (_localSettingsChange) {
+		_localSettingsChange = false;
+		return;
+	}
+	const revision = _settingsRevision;
+	const settings = await getSettings();
+	if (settings && revision === _settingsRevision && !settingsSaveQueue.busy) {
+		if (settings.theme === "lima") settings.theme = "dark";
+		Object.assign(launcherStore.settings, settings);
+	}
+}
+
+export function saveSettings(): Promise<void> {
+	markLocalSettingsChange();
+	return settingsSaveQueue.request();
+}
+
+export function scheduleSettingsSave(): Promise<void> {
+	markLocalSettingsChange();
+	return settingsSaveQueue.request(120);
+}
+
+export function flushSettingsSaves(): Promise<void> {
+	return settingsSaveQueue.flush();
+}
+
+async function persistSettings(): Promise<void> {
+	// Discord RPC está desconectado del launcher (ver cubicApi.initDiscordPresence).
+	await updateSettings(launcherStore.settings);
+}
+
+export async function killInst(uuid: string): Promise<void> {
+	try {
+		await killInstance(uuid, () => {
+			const idx = launcherStore.runningInstances.indexOf(uuid);
+			if (idx !== -1) launcherStore.runningInstances.splice(idx, 1);
+		});
+	} catch (err) {
+		showErrorParsed(err);
+	}
+}
+
+export async function deleteInst(uuid: string): Promise<boolean> {
+	try {
+		await invoke("delete_instance", { id: uuid });
+
+		removeDeletedInstance(uuid);
+		return true;
+	} catch (err) {
+		showErrorParsed(err);
+		return false;
+	}
+}
+
+function removeDeletedInstance(uuid: string): void {
+	_instancesRevision++;
+	_deletedInstances.add(uuid);
+	const idx = launcherStore.loadedInstances.findIndex(
+		(instance) => instance.uuid === uuid,
+	);
+	if (idx !== -1) launcherStore.loadedInstances.splice(idx, 1);
+	_refreshCallbacks.delete(uuid);
+	if (launcherStore.pendingJreLaunch?.instance.uuid === uuid)
+		clearPendingJreLaunch();
+}
+
+export async function renameInst(uuid: string, newName: string): Promise<void> {
+	try {
+		await invoke("rename_instance", {
+			id: uuid,
+			newName,
+		});
+
+		await getVersions();
+	} catch (err) {
+		showErrorParsed(err);
+	}
+}
+
+export async function updateInst(
+	uuid: string,
+	newName?: string,
+	newVersion?: string,
+	newIcon?: string | null,
+	newOverrides?: InstOverrides | null,
+): Promise<void> {
+	try {
+		await invoke("update_instance", {
+			id: uuid,
+			newName,
+			newVersion,
+			newIcon,
+			newOverrides,
+		});
+
+		await getVersions();
+	} catch (err) {
+		showErrorParsed(err);
+	}
+}
+
+export function sortInstances(instances: InstanceDto[]): void {
+	instances.sort(
+		(a, b) =>
+			Number(b.pinned) - Number(a.pinned) || a.name.localeCompare(b.name),
+	);
+}
+
+export function updateInstanceInStore(dto: InstanceDto): void {
+	const instances = launcherStore.loadedInstances;
+	const idx = instances.findIndex((i) => i.uuid === dto.uuid);
+	if (idx !== -1) {
+		instances[idx] = dto;
+	}
+	sortInstances(instances);
+}
+
+export async function getVersions(): Promise<void> {
+	const request = ++_instancesRequest;
+	launcherStore.instancesLoading = true;
+	try {
+		while (request === _instancesRequest) {
+			const revision = _instancesRevision;
+			const instances: InstanceDto[] = await invoke("get_instances");
+			if (request !== _instancesRequest) return;
+			// An event changed the registry while this snapshot was being collected.
+			if (revision !== _instancesRevision) continue;
+			const current = instances.filter(
+				(instance) => !_deletedInstances.has(instance.uuid),
+			);
+			sortInstances(current);
+			launcherStore.loadedInstances.splice(
+				0,
+				launcherStore.loadedInstances.length,
+				...current,
+			);
+			return;
+		}
+	} finally {
+		if (request === _instancesRequest) {
+			launcherStore.instancesLoading = false;
+		}
+	}
+}

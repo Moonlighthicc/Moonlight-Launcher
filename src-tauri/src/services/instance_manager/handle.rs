@@ -1,0 +1,539 @@
+use crate::core::{AppEvent, InstanceError, emit};
+use crate::services::{InstOverrides, SettingsManager, image_pipeline};
+use compact_str::ToCompactString;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use tracing::warn;
+
+use super::data::{InstanceData, InstanceDto};
+
+use super::manager::signal_kill;
+use super::status::{AtomicStatus, InstanceStatus};
+
+fn is_asset_icon(icon: &str) -> bool {
+    icon.starts_with("/images/")
+}
+
+fn normalize_icon_path(icon: &str, instance_dir: &Path) -> Arc<str> {
+    if is_asset_icon(icon) {
+        return icon.into();
+    }
+    let path = Path::new(icon);
+    if path.is_absolute()
+        && let Ok(rel) = path.strip_prefix(instance_dir)
+    {
+        return rel.to_string_lossy().to_string().into();
+    }
+    icon.into()
+}
+
+/// Reconoce los iconos que ya pasaron por `image_pipeline` para que la
+/// migración sea idempotente. Solo acepta `icons/icon_<16 hex>.png`.
+fn is_normalized_icon(icon_path: &Path, instance_dir: &Path) -> bool {
+    let Ok(relative) = icon_path.strip_prefix(instance_dir) else {
+        return false;
+    };
+    if relative.parent() != Some(Path::new("icons")) {
+        return false;
+    }
+    let Some(file_name) = relative.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(hash) = file_name
+        .strip_prefix("icon_")
+        .and_then(|name| name.strip_suffix(".png"))
+    else {
+        return false;
+    };
+    hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(Clone)]
+pub struct InstanceHandle {
+    pub uuid: Arc<str>,
+    data: Arc<RwLock<InstanceData>>,
+    status: Arc<AtomicStatus>,
+    files_lock: Arc<tokio::sync::Mutex<()>>,
+    deleted: Arc<AtomicBool>,
+    /// Inicio de la sesión de juego en curso, solo en memoria. El total se
+    /// persiste en `playtime_seconds` al cerrar la sesión.
+    play_session_start: Arc<std::sync::Mutex<Option<Instant>>>,
+	play_session_count: Arc<AtomicUsize>,
+}
+
+/// Admission to an instance's filesystem. Clones share deletion state and the lock.
+pub struct InstanceFilesGuard {
+    handle: InstanceHandle,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl InstanceFilesGuard {
+    pub async fn save_if_dirty(&self) -> Result<(), io::Error> {
+        self.handle.ensure_alive()?;
+        self.handle.data.write().await.save().await
+    }
+
+    pub(super) fn mark_deleted(&self) {
+        self.handle.deleted.store(true, Ordering::Release);
+    }
+}
+
+impl InstanceHandle {
+    pub(crate) fn new(data: InstanceData) -> Self {
+        Self {
+            uuid: data.uuid.clone(),
+            data: Arc::new(RwLock::new(data)),
+            status: Arc::new(AtomicStatus::new()),
+            files_lock: Arc::new(tokio::sync::Mutex::new(())),
+            deleted: Arc::new(AtomicBool::new(false)),
+            play_session_start: Arc::new(std::sync::Mutex::new(None)),
+			play_session_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub async fn load(name: &str) -> Option<Self> {
+        let root = crate::core::PathManager::get()
+            .get_instance_dir()
+            .join(name);
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || crate::services::modpack_update::recover(&root))
+                .await
+                .ok()?
+        {
+            tracing::error!(%error, name, "Cannot restore interrupted modpack update");
+            return None;
+        }
+        let mut data = InstanceData::load(name).await?;
+
+        // Migrate legacy absolute custom icon paths to instance-relative paths.
+        if let Some(icon) = data.icon.as_ref() {
+            let icon_str = icon.as_ref();
+            if !is_asset_icon(icon_str) {
+                let instance_dir = data.get_instance_dir();
+                let path = Path::new(icon_str);
+                if path.is_absolute()
+                    && let Ok(rel) = path.strip_prefix(&instance_dir)
+                {
+                    data.icon = Some(rel.to_string_lossy().to_string().into());
+                    data.dirty = true;
+                }
+            }
+        }
+
+        Some(Self::new(data))
+    }
+
+    pub fn get_status(&self) -> InstanceStatus {
+        self.status.get()
+    }
+
+    pub fn set_status(&self, status: InstanceStatus) {
+        self.status.set(status);
+        emit(AppEvent::InstanceEdited {
+            id: self.uuid.to_compact_string(),
+            dto: None,
+        });
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.get_status().is_busy()
+    }
+
+    /// Held across world/server operations, instance moves/deletion and launch admission.
+    pub fn try_lock_files(&self) -> Result<InstanceFilesGuard, String> {
+        let lock =
+            self.files_lock.clone().try_lock_owned().map_err(|_| {
+                "A file operation is already in progress on this instance".to_string()
+            })?;
+        self.ensure_alive().map_err(|e| e.to_string())?;
+        let data = self
+            .data
+            .try_read()
+            .map_err(|_| "The instance is being modified".to_string())?;
+        if data
+            .get_instance_dir()
+            .join(crate::services::modpack_update::JOURNAL_DIR)
+            .exists()
+        {
+            return Err("There is a pending update recovery. Restart the launcher to restore it".into());
+        }
+        Ok(InstanceFilesGuard {
+            handle: self.clone(),
+            _lock: lock,
+        })
+    }
+
+    /// Reapunta la raíz de la instancia tras una migración de almacenamiento.
+    /// Resincroniza desde disco: el archivo instance.cub quedó en la nueva
+    /// ubicación y podría diferir de la copia en memoria.
+    pub(crate) async fn repoint_root(&self, new_root: std::path::PathBuf) {
+        let mut data = self.data.write().await;
+        data.instance_root = new_root;
+        if let Some(loaded) = InstanceData::load(&data.name).await {
+            let dirty = data.dirty;
+            *data = loaded;
+            data.dirty = dirty;
+        }
+    }
+
+    fn ensure_alive(&self) -> Result<(), io::Error> {
+        if self.deleted.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "The instance was deleted",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn kill(&self) -> Result<(), InstanceError> {
+        signal_kill(&self.uuid);
+        self.set_status(if super::manager::has_running_processes(&self.uuid) { InstanceStatus::Started } else { InstanceStatus::Off });
+        Ok(())
+    }
+
+    pub async fn get_name(&self) -> Arc<str> {
+        self.data.read().await.name.clone()
+    }
+
+    pub async fn get_version(&self) -> Arc<str> {
+        self.data.read().await.version.clone()
+    }
+
+    pub async fn get_min_memory(&self) -> u32 {
+        self.data
+            .read()
+            .await
+            .min_memory
+            .unwrap_or_else(|| SettingsManager::read().get_min_memory())
+    }
+
+    pub async fn get_max_memory(&self) -> u32 {
+        self.data
+            .read()
+            .await
+            .max_memory
+            .unwrap_or_else(|| SettingsManager::read().get_max_memory())
+    }
+
+    pub async fn get_instance_dir(&self) -> PathBuf {
+        self.data.read().await.get_instance_dir()
+    }
+
+    pub async fn get_icon(&self) -> Option<Arc<str>> {
+        self.data.read().await.icon.clone()
+    }
+
+    pub async fn get_overrides(&self) -> Option<InstOverrides> {
+        self.data.read().await.overrides.clone()
+    }
+
+    pub async fn get_pinned(&self) -> bool {
+        self.data.read().await.pinned
+    }
+
+    pub async fn get_options_profile_id(&self) -> Option<Arc<str>> {
+        self.data.read().await.options_profile_id.clone()
+    }
+
+    pub async fn get_auto_apply_options(&self) -> bool {
+        self.data.read().await.auto_apply_options
+    }
+
+    pub async fn get_minecraft_jar(&self) -> crate::services::minecraft_jar::MinecraftJarConfig {
+        self.data.read().await.minecraft_jar.clone()
+    }
+
+    /// Caller holds the instance files guard. Roll back memory on save failure.
+    pub async fn save_minecraft_jar(
+        &self,
+        config: crate::services::minecraft_jar::MinecraftJarConfig,
+    ) -> Result<(), String> {
+        config.validate()?;
+        let mut data = self.data.write().await;
+        let old = std::mem::replace(&mut data.minecraft_jar, config);
+        data.dirty = true;
+        if let Err(e) = data.save().await {
+            data.minecraft_jar = old;
+            return Err(e.to_string());
+        }
+        Ok(())
+    }
+
+    pub async fn set_pinned(&self, pinned: bool) {
+        let mut data = self.data.write().await;
+        data.pinned = pinned;
+        data.dirty = true;
+    }
+
+    pub async fn set_options_profile(&self, profile_id: Option<Arc<str>>, auto_apply: bool) {
+        let mut data = self.data.write().await;
+        data.options_profile_id = profile_id;
+        data.auto_apply_options = auto_apply;
+        data.dirty = true;
+    }
+
+    pub async fn get_icon_absolute(&self) -> Option<Arc<str>> {
+        let data = self.data.read().await;
+        Self::resolve_icon_absolute(&data)
+    }
+
+    fn resolve_icon_absolute(data: &InstanceData) -> Option<Arc<str>> {
+        let icon = data.icon.as_ref()?;
+        let icon_str = icon.as_ref();
+        if is_asset_icon(icon_str) {
+            return Some(icon.clone());
+        }
+        Some(
+            data.get_instance_dir()
+                .join(icon_str)
+                .to_string_lossy()
+                .to_string()
+                .into(),
+        )
+    }
+
+    pub async fn to_dto(&self) -> InstanceDto {
+        let data = self.data.read().await;
+        InstanceDto {
+            name: data.name.clone(),
+            version: data.version.clone(),
+            loader: std::borrow::Cow::Borrowed(data.get_loader()),
+            last_played: data.last_played,
+            playtime_seconds: data.playtime_seconds,
+            status: self.get_status(),
+            cover_image: data.cover_image.clone(),
+            icon: Self::resolve_icon_absolute(&data),
+            uuid: self.uuid.clone(),
+            path: data.get_instance_dir(),
+            overrides: data.overrides.clone(),
+            pinned: data.pinned,
+            options_profile_id: data.options_profile_id.clone(),
+            auto_apply_options: data.auto_apply_options,
+            created_at: data.created_at,
+        }
+    }
+    pub async fn set_name(&self, name: String) {
+        let mut data = self.data.write().await;
+        data.name = name.into();
+        data.dirty = true;
+    }
+
+    pub async fn set_overrides(&self, overrides: Option<InstOverrides>) {
+        let mut data = self.data.write().await;
+        data.overrides = overrides;
+        data.dirty = true;
+    }
+
+    pub async fn set_version(&self, version: String) {
+        let mut data = self.data.write().await;
+        data.version = version.into();
+        data.dirty = true;
+    }
+
+    /// Caller owns the instance files guard for the complete pack transaction.
+    pub(crate) async fn save_pack_version(&self) -> Result<(), String> {
+        self.ensure_alive().map_err(|e| e.to_string())?;
+        let mut data = self.data.write().await;
+        let destination = data.get_instance_dir().join("instance.cub");
+        let bytes = serde_json::to_vec(&*data).map_err(|e| e.to_string())?;
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            use std::io::Write;
+            let mut temp =
+                tempfile::NamedTempFile::new_in(destination.parent().ok_or("Invalid path")?)
+                    .map_err(|e| e.to_string())?;
+            temp.write_all(&bytes).map_err(|e| e.to_string())?;
+            temp.as_file().sync_all().map_err(|e| e.to_string())?;
+            temp.persist(destination).map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        data.dirty = false;
+        Ok(())
+    }
+
+    pub async fn set_icon(&self, icon: Option<String>) {
+        let mut data = self.data.write().await;
+        let instance_dir = data.get_instance_dir();
+        data.icon = icon.map(|s| normalize_icon_path(&s, &instance_dir));
+        data.dirty = true;
+    }
+
+    /// Reescala un icono legacy a un PNG de 256 px con nombre content-addressed.
+    ///
+    /// Es idempotente y best-effort: si el archivo no existe, si el formato no
+    /// se puede decodificar o si el guardado falla, la instancia conserva el
+    /// icono anterior en lugar de quedar rota.
+    pub(crate) async fn migrate_icon_if_needed(&self) -> bool {
+        let Some(current) = self.get_icon().await else {
+            return false;
+        };
+        if is_asset_icon(&current) {
+            return false;
+        }
+
+        let instance_dir = self.get_instance_dir().await;
+        let current_path = {
+            let path = Path::new(current.as_ref());
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                instance_dir.join(path)
+            }
+        };
+        if !current_path.is_file() || is_normalized_icon(&current_path, &instance_dir) {
+            return false;
+        }
+
+        let source = current_path.clone();
+        let normalized =
+            match tokio::task::spawn_blocking(move || image_pipeline::normalize_icon_file(&source))
+                .await
+            {
+                Ok(Ok(icon)) => icon,
+                Ok(Err(error)) => {
+                    warn!("Could not migrate the icon of {}: {}", self.uuid, error);
+                    return false;
+                }
+                Err(error) => {
+                    warn!("Could not migrate the icon of {}: {}", self.uuid, error);
+                    return false;
+                }
+            };
+
+        let Ok(files_guard) = self.try_lock_files() else {
+            return false;
+        };
+        // Si la instancia se renombró mientras se procesaba, la ruta de destino
+        // ya no es válida: se reintenta en el próximo arranque.
+        if self.get_instance_dir().await != instance_dir {
+            return false;
+        }
+        // Si el usuario cambió el icono mientras se procesaba, no pisarlo.
+        if self.get_icon().await.as_deref() != Some(current.as_ref()) {
+            return false;
+        }
+
+        let icons_dir = instance_dir.join("icons");
+        let store_dir = icons_dir.clone();
+        let destination = match tokio::task::spawn_blocking(move || {
+            image_pipeline::store_normalized_icon(&store_dir, &normalized)
+        })
+        .await
+        {
+            Ok(Ok(path)) => path,
+            Ok(Err(error)) => {
+                warn!(
+                    "Could not save the migrated icon of {}: {}",
+                    self.uuid, error
+                );
+                return false;
+            }
+            Err(error) => {
+                warn!(
+                    "Could not save the migrated icon of {}: {}",
+                    self.uuid, error
+                );
+                return false;
+            }
+        };
+
+        self.set_icon(Some(destination.to_string_lossy().to_string()))
+            .await;
+        if let Err(error) = files_guard.save_if_dirty().await {
+            self.set_icon(Some(current.to_string())).await;
+            warn!(
+                "Could not save the migrated icon of {}: {}",
+                self.uuid, error
+            );
+            return false;
+        }
+
+        // El icono nuevo ya está persistido: borrar el legacy es best-effort.
+        let keep = destination.clone();
+        let cleanup_dir = icons_dir;
+        let _ = tokio::task::spawn_blocking(move || {
+            image_pipeline::remove_icon_files(&cleanup_dir, Some(&keep))
+        })
+        .await;
+
+        emit(AppEvent::InstanceEdited {
+            id: self.uuid.to_compact_string(),
+            dto: None,
+        });
+        true
+    }
+
+    pub async fn set_cover_image(&self, cover_image: Option<PathBuf>) {
+        let mut data = self.data.write().await;
+        data.cover_image = cover_image;
+        data.dirty = true;
+    }
+
+    pub async fn update_last_played(&self) {
+        let mut data = self.data.write().await;
+        data.last_played = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        data.dirty = true;
+    }
+
+    pub async fn get_playtime_seconds(&self) -> u64 {
+        self.data.read().await.playtime_seconds
+    }
+
+    /// Marca el inicio de una sesión de juego (solo en memoria).
+    pub fn begin_play_session(&self) {
+        if self.play_session_count.fetch_add(1, Ordering::AcqRel) == 0 {
+            let mut slot = self.play_session_start.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(Instant::now());
+        }
+    }
+
+    /// Cierra la sesión en curso y acumula el tiempo jugado en `playtime_seconds`.
+    /// Notifica a la UI con el DTO actualizado para que el total se vea al
+    /// instante, sin esperar al siguiente refresco.
+    pub async fn end_play_session(&self) {
+        let previous = self.play_session_count.try_update(Ordering::AcqRel, Ordering::Acquire, |count| if count > 0 { Some(count - 1) } else { None }).unwrap_or(0);
+        if previous > 1 || previous == 0 { return; }
+        let start = self.play_session_start.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(start) = start else {
+            return;
+        };
+        let elapsed = start.elapsed().as_secs();
+        if elapsed == 0 {
+            return;
+        }
+        {
+            let mut data = self.data.write().await;
+            data.playtime_seconds = data.playtime_seconds.saturating_add(elapsed);
+            data.dirty = true;
+            if let Err(e) = data.save().await {
+                warn!("Could not save the playtime: {e}");
+            }
+        }
+        emit(AppEvent::InstanceEdited {
+            id: self.uuid.to_compact_string(),
+            dto: Some(self.to_dto().await),
+        });
+    }
+
+    pub async fn save_if_dirty(&self) -> Result<(), io::Error> {
+        let lock = self.files_lock.clone().lock_owned().await;
+        let guard = InstanceFilesGuard {
+            handle: self.clone(),
+            _lock: lock,
+        };
+        guard.save_if_dirty().await
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/services/instance_manager/handle.rs"]
+mod tests;

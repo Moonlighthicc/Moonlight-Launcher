@@ -1,0 +1,634 @@
+<script lang="ts">
+	import { onMount } from "svelte";
+	import { getDownloadQueue } from "$lib/api/cubicApi";
+	import { SvelteMap, SvelteSet } from "svelte/reactivity";
+	import { t } from "$lib/i18n";
+	import { onAppEvent } from "$lib/api/launcherService";
+	import CheckIcon from "$lib/icons/CheckIcon.svelte";
+	import DownloadIcon from "$lib/icons/DownloadIcon.svelte";
+	import ChevronDownIcon from "$lib/icons/ChevronDownIcon.svelte";
+
+	type SegmentKey =
+		| "Library"
+		| "Asset"
+		| "Native"
+		| "Client"
+		| "Verifying"
+		| "Generic"
+		| "Processing"
+		| "Extracting"
+		| "Finishing"
+		| "Jre";
+	const SEGMENTS: SegmentKey[] = [
+		"Library",
+		"Asset",
+		"Native",
+		"Client",
+		"Verifying",
+		"Generic",
+		"Processing",
+		"Extracting",
+		"Finishing",
+		"Jre",
+	];
+
+	const SEGMENT_COLORS: Record<SegmentKey, string> = {
+		Library: "var(--download-library)",
+		Asset: "var(--download-asset)",
+		Native: "var(--download-native)",
+		Client: "var(--download-client)",
+		Verifying: "var(--download-verifying)",
+		Generic: "var(--download-generic)",
+		Processing: "var(--download-processing)",
+		Extracting: "var(--download-processing)",
+		Finishing: "var(--download-processing)",
+		Jre: "var(--download-jre)",
+	};
+
+	const SEGMENT_LABELS: Record<SegmentKey, string> = {
+		Library: "LIB",
+		Asset: "ASSET",
+		Native: "NAT",
+		Client: "CLIENT",
+		Verifying: "VERIFY",
+		Generic: "DL",
+		Processing: "PROC",
+		Extracting: "EXTRACT",
+		Finishing: "DONE",
+		Jre: "JAVA",
+	};
+
+	interface SegmentProgress {
+		current: number;
+		total: number;
+	}
+
+	interface DownloadItem {
+		version: string;
+		activeType: SegmentKey | null;
+		segments: Record<SegmentKey, SegmentProgress>;
+		done: boolean;
+		/** Bytes del lote actual; el porcentaje se calcula sobre ellos. */
+		bytesCurrent: number;
+		bytesTotal: number;
+	}
+
+	/** Etapas que llegan al empezar o terminar un lote: la barra vuelve a cero. */
+	const BATCH_RESET_STAGES = new Set(["pending", "resolving", "mc", "jre"]);
+
+	function emptySegments(): Record<SegmentKey, SegmentProgress> {
+		return {
+			Library: { current: 0, total: 0 },
+			Asset: { current: 0, total: 0 },
+			Native: { current: 0, total: 0 },
+			Client: { current: 0, total: 0 },
+			Verifying: { current: 0, total: 0 },
+			Generic: { current: 0, total: 0 },
+			Processing: { current: 0, total: 0 },
+			Extracting: { current: 0, total: 0 },
+			Finishing: { current: 0, total: 0 },
+			Jre: { current: 0, total: 0 },
+		};
+	}
+
+	function statusLabel(key: SegmentKey | null): string {
+		switch (key) {
+			case "Library":
+				return t("downloadProgress.statusLibs");
+			case "Asset":
+				return t("downloadProgress.statusAssets");
+			case "Native":
+				return t("downloadProgress.statusNatives");
+			case "Client":
+				return t("downloadProgress.statusClient");
+			case "Verifying":
+				return t("downloadProgress.statusVerifying");
+			case "Generic":
+				return t("downloadProgress.statusGeneric");
+			case "Processing":
+				return t("downloadProgress.statusProcessing");
+			case "Extracting":
+				return t("downloadProgress.statusExtracting");
+			case "Finishing":
+				return t("downloadProgress.statusFinishing");
+			case "Jre":
+				return t("downloadProgress.statusJre");
+			default:
+				return t("downloadProgress.statusGeneric");
+		}
+	}
+
+	function normalizeStage(stage: string): SegmentKey {
+		const map: Record<string, SegmentKey> = {
+			library: "Library",
+			asset: "Asset",
+			native: "Native",
+			client: "Client",
+			verifying: "Verifying",
+			generic: "Generic",
+			processing: "Processing",
+			finishing: "Finishing",
+			jre: "Jre",
+			extracting: "Extracting",
+			resolving: "Generic",
+			mc: "Generic",
+		};
+		return map[stage.toLowerCase()] ?? "Generic";
+	}
+
+	const removalTimers = new SvelteSet<ReturnType<typeof setTimeout>>();
+	let downloads = new SvelteMap<string, DownloadItem>();
+	let expanded = $state(false);
+	let activeCount = $derived(
+		[...downloads.values()].filter((d) => !d.done).length,
+	);
+	let doneCount = $derived(
+		[...downloads.values()].filter((d) => d.done).length,
+	);
+
+	onMount(() => {
+		getDownloadQueue().then((queue) => {
+			for (const item of queue) {
+				if (!downloads.has(item.version)) {
+					downloads.set(item.version, {
+						version: item.version,
+						activeType: null,
+						segments: emptySegments(),
+						done: item.status === "done",
+						bytesCurrent: 0,
+						bytesTotal: 0,
+					});
+				}
+			}
+			if (queue.length > 0) {
+				expanded = true;
+			}
+		});
+
+		const unsubProgress = onAppEvent("DProgress", (payload) => {
+			const {
+				version,
+				stage,
+				item_current,
+				item_total,
+				bytes_current,
+				bytes_total,
+			} = payload.data as {
+				version: string;
+				stage: string;
+				item_current: number;
+				item_total: number;
+				bytes_current: number;
+				bytes_total: number;
+			};
+			const isNew = !downloads.has(version);
+			const existing = downloads.get(version) ?? {
+				version,
+				activeType: null,
+				segments: emptySegments(),
+				done: false,
+				bytesCurrent: 0,
+				bytesTotal: 0,
+			};
+			const key = normalizeStage(stage);
+			const useBytes = bytes_total > 0;
+			const current = useBytes ? bytes_current : item_current;
+			const total = useBytes ? bytes_total : item_total;
+			existing.segments[key] = { current, total };
+			existing.activeType = key;
+			existing.done = false;
+			existing.bytesCurrent = useBytes ? bytes_current : 0;
+			existing.bytesTotal = useBytes ? bytes_total : 0;
+			downloads.set(version, { ...existing });
+			if (isNew) expanded = true;
+		});
+		const unsubStage = onAppEvent("DStage", (payload) => {
+			const { version, stage } = payload.data as {
+				version: string;
+				stage: string;
+			};
+			const existing = downloads.get(version);
+			if (existing) {
+				if (BATCH_RESET_STAGES.has(stage)) {
+					existing.segments = emptySegments();
+					existing.bytesCurrent = 0;
+					existing.bytesTotal = 0;
+				}
+				existing.activeType = stage === "pending" ? null : normalizeStage(stage);
+				downloads.set(version, { ...existing });
+			}
+		});
+		const unsubFinish = onAppEvent("DFinish", (payload) => {
+			const { version } = payload.data as { version: string };
+			const item = downloads.get(version);
+			if (item) {
+				downloads.set(version, {
+					...item,
+					done: true,
+					activeType: null,
+				});
+			}
+			const t = setTimeout(() => {
+				removalTimers.delete(t);
+				downloads.delete(version);
+			}, 4000);
+			removalTimers.add(t);
+		});
+
+		return () => {
+			unsubProgress();
+			unsubStage();
+			unsubFinish();
+			for (const t of removalTimers) clearTimeout(t);
+		};
+	});
+
+	function toggle() {
+		expanded = !expanded;
+	}
+
+	/** Solo la fase activa muestra progreso: las demás no tienen bytes propios. */
+	function getSegmentPct(item: DownloadItem, key: SegmentKey): number {
+		if (item.done) return 100;
+		if (item.activeType !== key) return 0;
+		return getOverallPct(item);
+	}
+
+	/** Mismo criterio que la cola: por bytes del lote, nunca 100 antes de DFinish. */
+	function getOverallPct(item: DownloadItem): number {
+		if (item.done) return 100;
+		if (item.bytesTotal > 0) {
+			return Math.min(
+				99,
+				Math.max(0, Math.floor((item.bytesCurrent / item.bytesTotal) * 100)),
+			);
+		}
+		if (item.activeType) {
+			const s = item.segments[item.activeType];
+			if (s.total > 0) {
+				return Math.min(99, Math.max(0, Math.floor((s.current / s.total) * 100)));
+			}
+		}
+		return 0;
+	}
+</script>
+
+<div class="dl-tray" class:expanded>
+	<button type="button" class="dl-tray-tab" onclick={toggle}>
+		<div class="dl-tray-tab-left">
+			{#if activeCount > 0}
+				<span class="dl-tray-spinner"></span>
+				<span>{t("sidebar.downloading")}</span>
+			{:else if doneCount > 0}
+				<CheckIcon size={13} />
+				<span>{doneCount} {t("sidebar.completed")}</span>
+			{:else}
+				<DownloadIcon size={13} />
+				<span>{t("sidebar.noDownloads")}</span>
+			{/if}
+		</div>
+		<ChevronDownIcon size={11} class="dl-tray-chevron" />
+	</button>
+
+	<div class="dl-tray-body">
+		{#if downloads.size === 0}
+			<div class="dl-tray-empty">
+				<DownloadIcon size={26} />
+				<span class="dl-tray-empty-title"
+					>{t("sidebar.noDownloadsActive")}</span
+				>
+				<span class="dl-tray-empty-sub"
+					>{t("sidebar.noDownloadsActiveDesc")}</span
+				>
+			</div>
+		{:else}
+			{#each [...downloads.values()] as item (item.version)}
+				{@const overall = getOverallPct(item)}
+				<div class="dl-tray-item" class:done={item.done}>
+					<div class="dl-tray-item-header">
+						<div class="dl-tray-item-left">
+							{#if item.done}
+								<CheckIcon size={10} />
+							{:else}
+								<span class="dl-tray-spinner-sm"></span>
+							{/if}
+							<div class="dl-tray-version-wrap">
+								<span class="dl-tray-version"
+									>{item.version}</span
+								>
+								{#if !item.done && item.activeType}
+									<span class="dl-tray-status-label"
+										>{statusLabel(item.activeType)}</span
+									>
+								{/if}
+							</div>
+						</div>
+						<span class="dl-tray-pct" class:done={item.done}
+							>{overall}%</span
+						>
+					</div>
+
+					<div class="dl-tray-segments">
+						{#each SEGMENTS as key (key)}
+							{@const pct = getSegmentPct(item, key)}
+							{@const color = SEGMENT_COLORS[key]}
+							{@const isActive =
+								item.activeType === key && !item.done}
+							<div class="dl-tray-seg">
+								<div class="dl-tray-seg-header">
+									<span
+										class="dl-tray-seg-label"
+										style:color={pct > 0 || isActive
+											? color
+											: "var(--text-muted)"}
+									>
+										{SEGMENT_LABELS[key]}
+									</span>
+									<span
+										class="dl-tray-seg-pct"
+										style:color={pct > 0
+											? color
+											: "var(--text-muted)"}
+									>
+										{pct}%
+									</span>
+								</div>
+								<div class="dl-tray-seg-track">
+									<div
+										class="dl-tray-seg-fill"
+										class:active={isActive}
+										style:width="{pct}%"
+										style:background={color}
+									></div>
+								</div>
+							</div>
+						{/each}
+					</div>
+
+					<div class="dl-tray-overall-track">
+						<div
+							class="dl-tray-overall-fill"
+							style:width="{overall}%"
+						></div>
+					</div>
+				</div>
+			{/each}
+		{/if}
+	</div>
+</div>
+
+<style>
+	.dl-tray {
+		position: fixed;
+		top: 0;
+		right: 0;
+		z-index: 50;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+	}
+
+	.dl-tray-tab {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 9px 28px 9px 18px;
+		background: var(--bg-card);
+		border: none;
+		border-bottom: 1px solid var(--border-color);
+		border-left: 1px solid var(--border-color);
+		color: var(--text-muted);
+		cursor: pointer;
+
+		font-size: 0.75rem;
+		font-weight: 600;
+		user-select: none;
+		letter-spacing: 0.3px;
+		clip-path: polygon(0% 0%, 100% 0%, 100% 100%, 22px 100%);
+		transition:
+			background 0.15s ease,
+			color 0.15s ease;
+		min-width: 200px;
+	}
+
+	.dl-tray-tab:hover {
+		background: var(--surface-hover);
+		color: var(--text-secondary);
+	}
+
+	.dl-tray-tab-left {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex: 1;
+	}
+
+	.dl-tray-spinner {
+		width: 11px;
+		height: 11px;
+		border: 1.5px solid var(--border-color);
+		border-top-color: var(--text-muted);
+		border-radius: 50%;
+		animation: dl-spin 0.7s linear infinite;
+		will-change: transform;
+		flex-shrink: 0;
+	}
+
+	.dl-tray-spinner-sm {
+		width: 9px;
+		height: 9px;
+		border: 1.5px solid var(--border-color);
+		border-top-color: var(--text-muted);
+		border-radius: 50%;
+		animation: dl-spin 0.7s linear infinite;
+		will-change: transform;
+		flex-shrink: 0;
+	}
+
+	@keyframes dl-spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+
+	.dl-tray-body {
+		width: 340px;
+		max-height: 0;
+		overflow: hidden;
+		background: var(--bg-main);
+		border-bottom: 1px solid var(--border-color);
+		border-left: 1px solid var(--border-color);
+		transition:
+			max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+			opacity 0.2s ease;
+		opacity: 0;
+		pointer-events: none;
+	}
+
+	.dl-tray.expanded .dl-tray-body {
+		max-height: 360px;
+		opacity: 1;
+		overflow-y: auto;
+		pointer-events: all;
+	}
+
+	:global(.dl-tray-body::-webkit-scrollbar) {
+		width: 3px;
+	}
+	:global(.dl-tray-body::-webkit-scrollbar-thumb) {
+		background: var(--border-color);
+		border-radius: 3px;
+	}
+
+	.dl-tray-empty {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		padding: 28px 20px;
+		text-align: center;
+	}
+
+	.dl-tray-empty-title {
+		font-size: 0.75rem;
+		font-weight: 600;
+		color: var(--text-muted);
+	}
+	.dl-tray-empty-sub {
+		font-size: 0.68rem;
+		color: var(--text-muted);
+		line-height: 1.4;
+		max-width: 160px;
+	}
+
+	.dl-tray-item {
+		padding: 10px 14px 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		border-bottom: 1px solid var(--border-color);
+	}
+
+	.dl-tray-item:last-child {
+		border-bottom: none;
+	}
+
+	.dl-tray-item-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.dl-tray-item-left {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+	}
+
+	.dl-tray-version-wrap {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		min-width: 0;
+	}
+
+	.dl-tray-version {
+		font-size: 0.8rem;
+		font-weight: 700;
+		color: var(--text-primary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		max-width: 220px;
+	}
+
+	.dl-tray-status-label {
+		font-size: 0.6rem;
+		color: var(--text-muted);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		max-width: 180px;
+	}
+
+	.dl-tray-pct {
+		font-size: 0.7rem;
+		font-weight: 700;
+		color: var(--text-muted);
+		flex-shrink: 0;
+		transition: color 0.3s;
+	}
+
+	.dl-tray-pct.done {
+		color: var(--color-success);
+	}
+
+	.dl-tray-segments {
+		display: grid;
+		grid-template-columns: repeat(4, 1fr);
+		gap: 6px;
+	}
+
+	.dl-tray-seg {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+
+	.dl-tray-seg-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.dl-tray-seg-label {
+		font-size: 0.58rem;
+		font-weight: 700;
+		letter-spacing: 0.6px;
+		transition: color 0.3s;
+	}
+
+	.dl-tray-seg-pct {
+		font-size: 0.58rem;
+		font-weight: 700;
+		transition: color 0.3s;
+	}
+
+	.dl-tray-seg-track {
+		height: 3px;
+		background: var(--bg-input);
+		border-radius: 2px;
+		overflow: hidden;
+	}
+
+	.dl-tray-seg-fill {
+		height: 100%;
+		border-radius: 2px;
+		transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+		opacity: 0.75;
+	}
+
+	.dl-tray-seg-fill.active {
+		opacity: 1;
+	}
+	.dl-tray-item.done .dl-tray-seg-fill {
+		opacity: 0.5;
+	}
+
+	.dl-tray-overall-track {
+		width: 100%;
+		height: 2px;
+		background: var(--bg-input);
+		border-radius: 1px;
+		overflow: hidden;
+		margin-top: 2px;
+	}
+
+	.dl-tray-overall-fill {
+		height: 100%;
+		background: var(--text-muted);
+		border-radius: 1px;
+		transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+	}
+</style>

@@ -1,0 +1,288 @@
+:root {
+	--bg-main: #0a0a0a;
+	--bg-sidebar: #111113;
+	--bg-item-active: #18181a;
+	--bg-card: #111113;
+	--bg-input: #0a0a0a;
+	--bg-overlay: rgba(0, 0, 0, 0.7);
+	--bg-sidebar-gradient: var(--bg-sidebar);
+	--bg-card-gradient: var(--surface-card);
+	--text-primary: #f4f4f5;
+	--text-secondary: #a1a1aa;
+	--text-muted: #71717a;
+	--text-tertiary: #71717a;
+	--accent: #ffffff;
+	--accent-rgb: 255, 255, 255;
+	--accent-hover: #f4f4f5;
+	--accent-text: #0a0a0a;
+	--accent-primary: var(--accent);
+	--surface-rgb: 255, 255, 255;
+	--surface-hover: rgba(var(--surface-rgb), 0.06);
+	--surface-active: rgba(var(--surface-rgb), 0.08);
+	--surface-selected: rgba(var(--surface-rgb), 0.03);
+	--surface-card: rgba(var(--surface-rgb), 0.03);
+	--surface-input: rgba(var(--surface-rgb), 0.03);
+	--surface-dropdown: var(--bg-card);
+	--bg-surface: var(--bg-item-active);
+	--toast-bg: color-mix(in srgb, var(--bg-card) 84%, transparent);
+	--toast-border: rgba(var(--surface-rgb), 0.06);
+	--border-color: rgba(var(--surface-rgb), 0.06);
+	--border: var(--border-color);
+	--border-radius-sm: 8px;
+	--border-radius: 12px;
+	--border-radius-lg: 16px;
+	--border-radius-pill: 999px;
+	--border-width: 1px;
+	--focus-ring: var(--accent);
+	--selected-border: color-mix(in srgb, var(--accent) 44%, var(--border));
+	--selected-surface: color-mix(in srgb, var(--accent) 8%, var(--bg-card));
+	--button-height: 34px;
+	--icon-button-size: 32px;
+	--sidebar-width: 260px;
+	--sidebar-compact-width: 70px;
+	--sidebar-row-height: 52px;
+	--sidebar-compact-row-height: 50px;
+	--sidebar-row-gap: 8px;
+	--version-row-height: 78px;
+	--resource-row-height: 130px;
+	--resource-row-gap: 6px;
+	--resource-card-padding: 14px 16px;
+	--resource-icon-size: 56px;
+	--market-row-height: 224px;
+	--market-grid-gap: 12px;
+	--market-catalog-list-row-height: 132px;
+	--market-catalog-list-gap: 8px;
+	--market-card-min-width: 280px;
+	--market-grid-padding: 8px;
+	--market-card-padding: 14px;
+	--market-icon-size: 48px;
+	/* Shared by catalog cards, installed content and loading placeholders. */
+	--market-item-gap: 10px;
+	--market-title-size: 0.9rem;
+	--market-description-size: 0.75rem;
+	--market-button-padding: 5px 12px;
+	--market-installed-row-height: 84px;
+	--market-installed-row-gap: 6px;
+	--market-installed-icon-size: 40px;
+	--market-installed-padding: 8px 12px;
+	--market-detail-icon-size: 80px;
+	--market-detail-sidebar-width: 270px;
+	--market-page-padding: 24px;
+	--market-page-padding-compact: 14px;
+	/* Existing/custom themes inherit their palette without extra variables. */
+	--market-card-bg: var(--bg-card);
+	--market-panel-bg: var(--bg-sidebar);
+	--market-input-bg: var(--bg-input);
+	--market-hover-bg: color-mix(
+		in srgb,
+		var(--market-accent) 5%,
+		var(--bg-card)
+	);
+	--market-selected-bg: color-mix(
+		in srgb,
+		var(--market-accent) 10%,
+		var(--bg-card)
+	);
+	--market-border: var(--border);
+	--market-border-hover: color-mix(
+		in srgb,
+		var(--market-accent) 40%,
+		var(--market-border)
+	);
+	--market-card-radius: var(--border-radius);
+	--market-text-secondary: var(--text-secondary);
+	--market-accent: var(--accent);
+	--market-accent-hover: var(--accent-hover);
+	--market-accent-text: var(--accent-text);
+	--market-success: var(--color-success);
+	--market-error: var(--color-error);
+	--market-warning: var(--color-warning);
+	--market-info: var(--color-info);
+	--shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);
+	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
+	--shadow-lg: 0 8px 28px rgba(0, 0, 0, 0.6);
+	--font-family: "Cantarell", system-ui, sans-serif;
+	--font-size-base: 14px;
+	--font-family-mono:
+		ui-monospace, SFMono-Regular, "SF Mono", Consolas, "Liberation Mono",
+		Menlo, monospace;
+	--font-size-sm: 0.8rem;
+	--font-size-lg: 1.2rem;
+	--font-size-control: 0.85rem;
+	--font-size-label: 0.65rem;
+	--font-weight-normal: 400;
+	--font-weight-medium: 600;
+	--font-weight-bold: 700;
+	--line-height: 1.5;
+	--space-xs: 4px;
+	--space-sm: 8px;
+	--space-md: 12px;
+	--space-lg: 16px;
+	--space-xl: 24px;
+	--control-padding: 10px 12px;
+	--button-padding: 8px 16px;
+	--icon-scale: 1;
+	--transition-fast: 0.15s;
+	--transition-normal: 0.2s;
+	--font-loaded: 1;
+	--glow-error: 0 0 12px rgba(var(--color-error-rgb), 0.3);
+	--glow-success: 0 0 12px rgba(var(--color-success-rgb), 0.3);
+	--color-success: #22c55e;
+	--color-success-rgb: 34, 197, 94;
+	--color-version-installed: #16a34a;
+	--color-error: #ef4444;
+	--color-error-rgb: 239, 68, 68;
+	--color-warning: #eab308;
+	--color-warning-rgb: 234, 179, 8;
+	--color-info: #60a5fa;
+	--color-info-rgb: 96, 165, 250;
+	--color-status-starting: var(--color-info);
+	--color-status-started: var(--color-success);
+	/* Legacy names remain overridable by existing themes. */
+	--error: var(--color-error);
+	--warning: var(--color-warning);
+	--color-on-error: #fff;
+	--color-on-success: #fff;
+	--color-on-info: #fff;
+	--color-on-warning: #fff;
+	--surface-subtle: rgba(var(--surface-rgb), 0.02);
+	--surface-raised: rgba(var(--surface-rgb), 0.04);
+	--border-hover: rgba(var(--surface-rgb), 0.1);
+	--border-focus: rgba(var(--surface-rgb), 0.3);
+	--shadow-inset: inset 0 1px 2px rgba(0, 0, 0, 0.2);
+	--shadow-floating: var(--shadow-lg);
+	--shadow-image: var(--shadow-md);
+	--shadow-indicator: var(--shadow-sm);
+	--shadow-drawer-left: -8px 0 32px rgba(0, 0, 0, 0.6);
+	--shadow-drawer-right: 8px 0 32px rgba(0, 0, 0, 0.6);
+	--shadow-drawer-top: 0 -8px 32px rgba(0, 0, 0, 0.6);
+	--shadow-drawer-bottom: 0 8px 32px rgba(0, 0, 0, 0.6);
+	--media-overlay: rgba(0, 0, 0, 0.6);
+	--media-overlay-text: #fff;
+	--media-overlay-border: rgba(255, 255, 255, 0.1);
+	--viewer-overlay: rgba(0, 0, 0, 0.9);
+	--tutorial-overlay: rgba(0, 0, 0, 0.5);
+	--tutorial-overlay-soft: rgba(0, 0, 0, 0.15);
+	--bg-image-brightness: 0.4;
+	--bg-image-size: cover;
+	--bg-image-position: center;
+	--download-library: #4ade80;
+	--download-asset: #60a5fa;
+	--download-native: #f59e0b;
+	--download-client: #a78bfa;
+	--download-verifying: #f472b6;
+	--download-generic: #94a3b8;
+	--download-processing: #fb923c;
+	--download-jre: #22d3ee;
+	--log-trace: var(--text-muted);
+	--log-debug: var(--text-muted);
+	--log-info: var(--text-primary);
+	--log-message: var(--text-primary);
+	--log-warn: var(--color-warning);
+	--log-error: var(--color-error);
+	--log-fatal: var(--color-error);
+	--log-launcher: var(--text-primary);
+	--log-stderr: var(--color-error);
+	--log-unknown: var(--text-tertiary);
+	--log-font-size: 0.75rem;
+	--log-line-height: var(--line-height);
+	--log-line-padding: 2px 14px;
+	--log-line-min-height: 22px;
+	--icon-filter: invert(1);
+	--clr-loader-vanilla: #78909c;
+	--clr-loader-fabric: #66bb6a;
+	--clr-loader-forge: #ffa726;
+	--clr-loader-quilt: #ab47bc;
+	--backdrop-blur-overlay: 4px;
+	--backdrop-blur-modal: 4px;
+	--backdrop-blur-dropdown: 4px;
+	--backdrop-blur-panel: 2px;
+	--backdrop-blur-float: 4px;
+	--backdrop-blur-viewer: 2px;
+	--scrollbar-thumb-hover: var(--text-secondary);
+	--scrollbar-track: var(--bg-main);
+	--scrollbar-thumb: rgba(var(--surface-rgb), 0.12);
+	--scrollbar-size: 6px;
+	--scrollbar-radius: 10px;
+}
+
+html {
+	font-size: var(--font-size-base, 14px);
+	color-scheme: var(--color-scheme, normal);
+}
+
+* {
+	box-sizing: border-box;
+	margin: 0;
+	padding: 0;
+}
+
+body {
+	font-family: var(--font-family);
+	font-weight: var(--font-weight-normal);
+	background-color: var(--bg-main);
+	color: var(--text-primary);
+	overflow: hidden;
+	height: 100vh;
+	-webkit-user-select: none;
+	user-select: none;
+}
+
+button,
+input,
+select,
+textarea,
+optgroup,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+	font-family: inherit;
+}
+
+input,
+textarea,
+[contenteditable],
+.line-text {
+	-webkit-user-select: text;
+	user-select: text;
+}
+
+:is(
+	button,
+	a[href],
+	input,
+	select,
+	textarea,
+	summary,
+	[tabindex]
+):focus-visible {
+	outline: 2px solid var(--focus-ring);
+	outline-offset: 2px;
+}
+
+input::placeholder,
+textarea::placeholder {
+	color: var(--text-muted);
+	opacity: 1;
+}
+
+::-webkit-scrollbar {
+	width: var(--scrollbar-size);
+	height: var(--scrollbar-size);
+}
+
+::-webkit-scrollbar-track {
+	background: var(--scrollbar-track, transparent);
+}
+
+::-webkit-scrollbar-thumb {
+	background: var(--scrollbar-thumb, var(--border));
+	border-radius: var(--scrollbar-radius);
+}
+
+::-webkit-scrollbar-thumb:hover {
+	background: var(--scrollbar-thumb-hover, var(--text-secondary));
+}

@@ -1,0 +1,20 @@
+import { SvelteSet } from "svelte/reactivity";
+
+export type LocaleEntry = {
+	code: string;
+	id: string;
+	label: string;
+	flag: string;
+	percentage?: number;
+};
+
+export const i18nLoader = $state({
+	loading: null as string | null,
+	fetched: new SvelteSet<string>(["en"]),
+	dictVersion: {} as Record<string, number>,
+});
+
+export const locales = $state<LocaleEntry[]>([
+	{ code: "en", id: "en-US", label: "English", flag: "🇺🇸" },
+	{ code: "ru", id: "ru-RU", label: "Русский", flag: "🇷🇺" },
+]);

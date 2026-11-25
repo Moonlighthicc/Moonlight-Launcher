@@ -1,0 +1,305 @@
+mod commands;
+mod core;
+mod services;
+pub(crate) mod theme_watcher;
+
+pub use services::InstanceManager;
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let mut context = tauri::generate_context!();
+
+    // Auto-updates are disconnected from the launcher: the updater code is kept, but
+    // nothing is configured or registered, so no update server is ever contacted.
+    // Flip this to `true` (and set your own endpoints) to wire it back in.
+    const UPDATER_AVAILABLE: bool = false;
+
+    if UPDATER_AVAILABLE {
+        let plugins = &mut context.config_mut().plugins.0;
+        let updater_cfg = plugins
+            .entry("updater".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+
+        // Use the same cross-platform settings path as SettingsManager. HOME is
+        // not normally defined for Windows users launching from the Start menu.
+        let settings = core::PathManager::get()
+            .get_settings_dir()
+            .join("settings.cub");
+        let override_url = std::env::var("CUBIC_UPDATE_URL").ok();
+        if let Err(error) =
+            core::updater::configure(updater_cfg, &settings, override_url.as_deref())
+        {
+            tracing::warn!(%error, "Using the configured updater endpoints");
+        }
+    }
+
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    if UPDATER_AVAILABLE {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+    builder
+        .register_asynchronous_uri_scheme_protocol(
+            services::icon_protocol::SCHEME,
+            |_ctx, request, responder| {
+                tauri::async_runtime::spawn(async move {
+                    responder.respond(services::icon_protocol::respond(request).await);
+                });
+            },
+        )
+        .register_asynchronous_uri_scheme_protocol(
+            services::market_icon_cache::SCHEME,
+            |_ctx, request, responder| {
+                tauri::async_runtime::spawn(async move {
+                    responder.respond(services::market_icon_cache::respond(request).await);
+                });
+            },
+        )
+        .invoke_handler(tauri::generate_handler![
+            commands::instance::get_instances,
+            commands::instance::minecraft_jar::get_instance_minecraft_jar,
+            commands::instance::minecraft_jar::instance_minecraft_jar_action,
+            commands::instance::create_instance,
+            commands::instance::launch,
+            commands::instance::kill_instance,
+            commands::instance::get_instance_processes,
+            commands::instance::export::export_instance_zip,
+            commands::instance::mrpack_export::preview_mrpack_export,
+            commands::instance::mrpack_export::export_instance_mrpack,
+            commands::instance::modpack::get_instance_modpack,
+            commands::instance::mod_versions::replace_instance_mod,
+            commands::instance::modpack::restore_modpack_inventory,
+            commands::instance::modpack::set_modpack_locked,
+            commands::instance::modpack::list_modpack_versions,
+            commands::instance::modpack::preview_modpack_update,
+            commands::instance::modpack::apply_modpack_update,
+            commands::instance::modpack::cancel_modpack_update,
+            commands::instance::delete_instance,
+            commands::instance::open_instance_dir,
+            commands::instance::rename_instance,
+            commands::instance::update_instance,
+            commands::instance::pin_instance,
+            commands::instance::options::apply_options_profile,
+            commands::instance::options::set_instance_options_profile,
+            commands::instance::get_installed_versions,
+            commands::instance::get_installed_versions_with_status,
+            commands::instance::check_version_integrity,
+            commands::instance::get_instance_mods,
+            commands::instance::mod_catalog::get_instance_mod_icons,
+            commands::instance::toggle_instance_mod,
+            commands::instance::get_instance_screenshot,
+            commands::instance::get_all_instance_screenshots,
+            commands::instance::get_screenshot_thumbnail,
+            commands::instance::worlds::get_instance_worlds,
+            commands::instance::worlds::instance_world_action,
+            commands::instance::servers::get_instance_servers,
+            commands::instance::servers::get_instance_server_icons,
+            commands::instance::servers::instance_server_action,
+            commands::instance::servers::start_instance_server_ping,
+            commands::instance::servers::cancel_instance_server_ping,
+            commands::instance::set_instance_cover_image,
+            commands::instance::reset_instance_cover_image,
+            commands::instance::get_instance_resourcepacks,
+            commands::instance::get_instance_shaderpacks,
+            commands::instance::delete_instance_file,
+            commands::instance::add_instance_file,
+            commands::instance::reinstall_version,
+            commands::instance::delete_installed_version,
+            commands::instance::instance_import::detect_instance_zip,
+            commands::instance::instance_import::import_instance_zip,
+            commands::instance::instance_import::cancel_instance_import,
+            commands::instance::migration::scan_launcher_migration,
+            commands::instance::migration::migrate_launcher_instances,
+            commands::instance::migration::cancel_launcher_migration,
+            commands::instance::upload_custom_icon,
+            commands::instance::reset_instance_icon,
+            commands::dependencies::resolve_mod_dependencies,
+            commands::download::add_to_queue,
+            commands::download::get_available_versions,
+            commands::download::get_fabric_versions,
+            commands::download::get_fabric_loader_versions,
+            commands::download::download_fabric,
+            commands::download::get_download_queue,
+            commands::download::get_download_snapshot,
+            commands::download::cancel_download,
+            commands::download::refresh_versions,
+            commands::download::get_forge_versions,
+            commands::download::refresh_forge_versions,
+            commands::download::get_neoforge_versions,
+            commands::download::refresh_neoforge_versions,
+            commands::download::get_loader_version_catalog,
+            commands::download::download_neoforge,
+            commands::download::get_quilt_versions,
+            commands::download::get_quilt_loader_versions,
+            commands::download::refresh_quilt_versions,
+            commands::download::download_quilt,
+            commands::others::open_url,
+            commands::settings::get_settings,
+            commands::settings::update_settings,
+            commands::settings::detect_java_paths,
+            commands::settings::get_recommended_ram,
+            commands::options_profiles::list_options_profiles,
+            commands::options_profiles::create_options_profile,
+            commands::options_profiles::update_options_profile,
+            commands::options_profiles::delete_options_profile,
+            commands::options_profiles::import_options_profile_from_file,
+            commands::options_profiles::create_options_profile_from_instance,
+            commands::storage::get_instances_dir_info,
+            commands::storage::change_instances_dir,
+            commands::storage::cancel_instances_dir_change,
+            commands::storage::reset_instances_dir,
+            commands::storage::get_shared_dir_info,
+            commands::storage::purge_shared_dir,
+            commands::storage::change_shared_dir,
+            commands::storage::reset_shared_dir,
+            commands::storage::get_cache_info,
+            commands::storage::purge_launcher_cache,
+            commands::i18n::save_locale,
+            commands::i18n::load_locale,
+            commands::i18n::refresh_locale,
+            commands::i18n::list_locales,
+            commands::auth::get_device_code,
+            commands::auth::authenticate_with_device_code,
+            commands::auth::start_webview_auth,
+            commands::auth::get_current_user,
+            commands::auth::logout,
+            commands::auth::switch_user,
+            commands::auth::remove_user,
+            commands::auth::get_user_list,
+            commands::auth::get_yggdrasil_server_info,
+            commands::auth::yggdrasil_authenticate,
+            commands::auth::yggdrasil_refresh_token,
+            commands::avatar::get_avatar_svg,
+            commands::themes::commands::list_themes,
+            commands::themes::commands::get_user_theme,
+            commands::themes::commands::set_theme,
+            commands::themes::commands::get_current_theme,
+            commands::themes::install::import_moon_theme,
+            commands::themes::commands::get_themes_dir_path,
+            commands::themes::commands::validate_theme,
+            commands::themes::install::remove_theme,
+            commands::themes::archive::export_theme,
+            commands::market::search_modrinth,
+            commands::market_requests::market_request,
+            commands::market_requests::cancel_market_request,
+            commands::market::get_modrinth_project,
+            commands::market::get_modrinth_project_versions,
+            commands::market::get_modrinth_version,
+            commands::market::get_modrinth_latest_versions,
+            commands::market::search_curseforge,
+            commands::market::search_curseforge_modpacks,
+            commands::market::get_curseforge_project,
+            commands::market::get_curseforge_project_description,
+            commands::market::get_curseforge_project_files,
+            commands::market::get_curseforge_file_download_url,
+            commands::modrinth::download_mods,
+            commands::modrinth::download_resourcepacks,
+            commands::modrinth::download_shaderpacks,
+            commands::modrinth::download_mrpack,
+            commands::pack::parse_mrpack,
+            commands::pack::parse_local_modpack,
+            commands::pack::install_mrpack,
+            commands::pack::download_curseforge_modpack,
+            commands::pack::parse_curseforge_modpack,
+            commands::pack::install_curseforge_modpack,
+            commands::profile::get_minecraft_profile,
+            commands::ely_profile::get_ely_skin_profile,
+            commands::yggdrasil_profile::get_yggdrasil_skin_profile,
+            commands::yggdrasil_profile::upload_yggdrasil_skin,
+            commands::yggdrasil_profile::upload_yggdrasil_skin_url,
+            commands::yggdrasil_profile::delete_yggdrasil_skin,
+            commands::profile::read_skin_preview_data,
+            commands::profile::upload_skin_file,
+            commands::profile::upload_skin_url,
+            commands::profile::equip_cape,
+            commands::profile::unequip_cape,
+            commands::skin_closet::get_skin_closet,
+            commands::skin_closet::open_skin_closet_dir,
+            commands::skin_closet::import_skin_to_closet,
+            commands::skin_closet::copy_server_skin_to_closet,
+            commands::skin_closet::copy_skin_preview_to_closet,
+            commands::skin_closet::remove_skin_from_closet,
+            commands::skin_closet::rename_skin_in_closet,
+            commands::skin_closet::get_closet_skin_preview,
+            commands::forge::install_forge,
+            commands::forge::download_forge,
+            commands::optifine::get_optifine_versions,
+            commands::optifine::refresh_optifine_versions,
+            commands::optifine::download_optifine,
+            commands::neoforge::install_neoforge,
+            commands::discord::init_discord_presence,
+            commands::discord::shutdown_discord_presence,
+            commands::java::get_jre_status,
+            commands::java::install_jre,
+            commands::java::uninstall_jre,
+            commands::java::get_jre_versions,
+            commands::java::get_available_jre_vendors,
+            commands::log_window::open_log_window,
+            commands::log_window::get_log_history_cmd,
+            commands::log_window::set_log_preview,
+            commands::log_window::upload_log_to_mclogs,
+        ])
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .setup(|app| {
+            if let Err(errors) = core::PathManager::ensure_dirs() {
+                use tauri_plugin_dialog::DialogExt;
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    handle
+                        .dialog()
+                        .message(format!(
+                            "Could not create the required directories:\n{}",
+                            errors.join("\n")
+                        ))
+                        .title("Initialization error")
+                        .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+                        .show(|_| std::process::exit(1));
+                });
+                return Err("Initialization error: could not create the directories".into());
+            }
+
+            commands::storage::allow_current_instances_asset_scope(app.handle())?;
+
+            // Publish InstanceManager before the frontend window can issue commands.
+            // Its data is loaded asynchronously, and accessors wait for readiness.
+            let instance_manager = InstanceManager::start();
+
+            let _window = services::launch_window::create_main_window(app.handle())?;
+
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::join!(
+                    services::DownloadQueue::init(Some(handle.clone())),
+                    async {
+                        services::Launcher::init().set_handle(handle.clone());
+                    },
+                    instance_manager.load_instances(),
+                    async {
+                        core::init(handle.clone());
+                    },
+                    theme_watcher::ThemeWatcher::start(),
+                );
+                services::settings_manager::init_auto_save();
+                let settings = services::SettingsManager::read();
+                theme_watcher::ThemeWatcher::watch(
+                    settings.theme.strip_prefix("user:").map(str::to_owned),
+                );
+            });
+            Ok(())
+        })
+        .build(context)
+        .expect("error while building tauri application")
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::ExitRequested {
+                api, code: None, ..
+            } if services::launch_window::should_keep_alive() => api.prevent_exit(),
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } if label == "main" => {
+                commands::log_window::clear_log_previews();
+                services::launch_window::on_main_destroyed(app_handle);
+            }
+            _ => {}
+        });
+}

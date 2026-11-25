@@ -1,0 +1,702 @@
+use base64::{Engine as _, engine::general_purpose};
+use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
+use std::collections::HashMap;
+use std::fs::File;
+use std::hash::{Hash, Hasher};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
+use tracing::debug;
+use zip::ZipArchive;
+
+// Bound both entry count and retained payload, and evict by actual use rather
+// than file modification time (which is often identical throughout a modpack).
+const MAX_CACHE_ENTRIES: usize = 1024;
+const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Icons render at 32-80 CSS px, which is up to ~240 physical px on a 3x
+/// display. 256 keeps that headroom while cutting the decoded bitmap 4x.
+const MAX_ICON_DIMENSION: u32 = 256;
+/// Guard against decompression bombs in untrusted mod archives.
+const MAX_ICON_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ICON_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_MOD_METADATA_BYTES: u64 = 1024 * 1024;
+const FORGE_METADATA: [&str; 2] = ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"];
+/// Mixed into the pack-cache fingerprint so a change to the icon pipeline
+/// rebuilds the on-disk cache exactly once.
+const PACK_CACHE_SCHEMA: u64 = 0x9e37_79b9_7f4a_7c16;
+
+/// Folds the icon-pipeline schema into a pack-cache fingerprint so changing
+/// the icon encoder rebuilds the on-disk pack cache exactly once.
+pub fn pack_cache_fingerprint(fingerprint: u64) -> u64 {
+    fingerprint ^ PACK_CACHE_SCHEMA
+}
+
+type CachedModInfo = (
+    (SystemTime, u64),
+    Option<AddonMetaNoIcon>,
+    Option<Arc<String>>,
+);
+
+#[derive(Default)]
+struct AddonCache {
+    entries: HashMap<PathBuf, (CachedModInfo, u64, usize)>,
+    clock: u64,
+    bytes: usize,
+}
+
+impl AddonCache {
+    fn get(&mut self, path: &Path) -> Option<&CachedModInfo> {
+        let entry = self.entries.get_mut(path)?;
+        self.clock += 1;
+        entry.1 = self.clock;
+        Some(&entry.0)
+    }
+
+    fn insert(&mut self, path: PathBuf, value: CachedModInfo) {
+        if let Some((_, _, bytes)) = self.entries.remove(&path) {
+            self.bytes -= bytes;
+        }
+        let bytes = path.as_os_str().len()
+            + value.2.as_ref().map_or(0, |icon| icon.len())
+            + value.1.as_ref().map_or(0, |meta| {
+                meta.name.len()
+                    + meta.version.as_ref().map_or(0, String::len)
+                    + meta.description.as_ref().map_or(0, String::len)
+                    + meta
+                        .authors
+                        .as_ref()
+                        .map_or(0, |authors| authors.iter().map(String::len).sum())
+            });
+        if bytes > MAX_CACHE_BYTES {
+            return;
+        }
+        while self.entries.len() >= MAX_CACHE_ENTRIES || self.bytes + bytes > MAX_CACHE_BYTES {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used, _))| *used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some((_, _, size)) = self.entries.remove(&oldest) {
+                self.bytes -= size;
+            }
+        }
+        self.clock += 1;
+        self.bytes += bytes;
+        self.entries.insert(path, (value, self.clock, bytes));
+    }
+}
+
+static ADDON_CACHE: LazyLock<Mutex<AddonCache>> =
+    LazyLock::new(|| Mutex::new(AddonCache::default()));
+
+#[cfg(test)]
+#[path = "../tests/services/addon_manager.rs"]
+mod tests;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AddonMetaNoIcon {
+    pub name: String,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub authors: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ModSource {
+    Local,
+    Modrinth {
+        project_id: String,
+        version_id: String,
+        slug: Option<String>,
+    },
+    CurseForge {
+        project_id: String,
+        file_id: String,
+    },
+}
+
+impl ModSource {
+    pub fn source_str(&self) -> &str {
+        match self {
+            ModSource::Local => "local",
+            ModSource::Modrinth { .. } => "modrinth",
+            ModSource::CurseForge { .. } => "curseforge",
+        }
+    }
+
+    pub fn project_id(&self) -> Option<&str> {
+        match self {
+            ModSource::Local => None,
+            ModSource::Modrinth { project_id, .. } => Some(project_id),
+            ModSource::CurseForge { project_id, .. } => Some(project_id),
+        }
+    }
+
+    pub fn version_id(&self) -> Option<&str> {
+        match self {
+            ModSource::Local => None,
+            ModSource::Modrinth { version_id, .. } => Some(version_id),
+            ModSource::CurseForge { file_id, .. } => Some(file_id),
+        }
+    }
+
+    pub fn slug(&self) -> Option<&str> {
+        match self {
+            ModSource::Modrinth { slug, .. } => slug.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Compute SHA1 of a file synchronously (for use in spawn_blocking)
+pub fn compute_file_sha1(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+    let mut hasher = Sha1::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let hash = hasher.finalize();
+    Ok(hash.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+// ── Pack cache (resourcepacks / shaderpacks) via ablage ──────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackCacheEntry {
+    pub source: ModSource,
+}
+
+/// Richer entry: stores metadata + icon + sha1 + source in one cache hit
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackFullCacheEntry {
+    pub sha1: String,
+    pub metadata: Option<AddonMetaNoIcon>,
+    pub icon: Option<String>,
+    pub source: ModSource,
+}
+
+fn pack_cache_path(dir: &Path) -> PathBuf {
+    dir.join(".pack_cache.crep")
+}
+
+pub fn pack_cache_path_custom(dir: &Path) -> PathBuf {
+    dir.join(".pack_cache.crep")
+}
+
+/// Read all full pack cache entries keyed by filename (includes metadata + icon)
+pub fn read_all_full_pack_cache(dir: &Path) -> HashMap<String, PackFullCacheEntry> {
+    let path = pack_cache_path(dir);
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let repo = ablage::Repo::open(&path);
+    let mut map = HashMap::new();
+    for key in repo.keys() {
+        if let Some(entry) = repo
+            .get(key)
+            .and_then(|e| postcard::from_bytes::<PackFullCacheEntry>(&e.data).ok())
+        {
+            map.insert(key.clone(), entry);
+        }
+    }
+    map
+}
+
+pub fn save_pack_cache(dir: &Path, filename: &str, entry: &PackCacheEntry) {
+    let mut repo = ablage::Repo::open(pack_cache_path(dir));
+    if let Ok(data) = postcard::to_stdvec(entry) {
+        repo.put(
+            filename.to_string(),
+            ablage::Entry {
+                version: 1,
+                fingerprint: 0,
+                data,
+            },
+        );
+        let _ = repo.flush();
+    }
+}
+
+pub fn remove_pack_cache(dir: &Path, filename: &str) {
+    let path = pack_cache_path(dir);
+    if !path.exists() {
+        return;
+    }
+    let mut repo = ablage::Repo::open(&path);
+    repo.remove(filename);
+    let _ = repo.flush();
+}
+
+pub fn file_fingerprint(filename: &str, mtime: &std::time::SystemTime, size: u64) -> u64 {
+    let nanos = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    filename.hash(&mut h);
+    let name_hash = h.finish();
+    name_hash ^ nanos ^ size
+}
+
+type ParserFn = fn(&mut ZipArchive<File>) -> Result<AddonMetaNoIcon, ()>;
+const MOD_PARSERS: &[ParserFn] = &[
+    AddonManager::try_parse_fabric,
+    AddonManager::try_parse_quilt,
+    AddonManager::try_parse_forge_modern,
+    AddonManager::try_parse_forge_legacy,
+];
+pub struct AddonManager;
+
+impl AddonManager {
+    fn parse_meta_and_icon(
+        path: &Path,
+        parse_fn: impl FnOnce(&mut ZipArchive<File>) -> Option<AddonMetaNoIcon>,
+    ) -> (Option<AddonMetaNoIcon>, Option<Arc<String>>) {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                debug!("Could not open {:?}: {}", path, e);
+                return (None, None);
+            }
+        };
+        let mut archive = match ZipArchive::new(file) {
+            Ok(a) => a,
+            Err(e) => {
+                debug!("Could not read ZIP {:?}: {}", path, e);
+                return (None, None);
+            }
+        };
+        let meta = parse_fn(&mut archive);
+        let icon = Self::extract_icon_from_archive(&mut archive);
+        (meta, icon)
+    }
+
+    /// Encodes icon bytes as a data URL, downscaling PNGs larger than
+    /// `MAX_ICON_DIMENSION`. Any decode/encode failure keeps the original
+    /// bytes, so a malformed icon can never break mod listing.
+    fn encode_icon(mime: &str, buf: Vec<u8>) -> String {
+        let data = if mime == "image/png" {
+            Self::downscale_png(&buf).unwrap_or(buf)
+        } else {
+            buf
+        };
+        format!(
+            "data:{};base64,{}",
+            mime,
+            general_purpose::STANDARD.encode(data)
+        )
+    }
+
+    fn downscale_png(buf: &[u8]) -> Option<Vec<u8>> {
+        use image::ImageDecoder;
+
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(4096);
+        limits.max_image_height = Some(4096);
+        limits.max_alloc = Some(MAX_ICON_DECODE_BYTES);
+        let mut decoder =
+            image::codecs::png::PngDecoder::with_limits(std::io::Cursor::new(buf), limits.clone())
+                .ok()?;
+        limits.reserve(decoder.total_bytes()).ok()?;
+        decoder.set_limits(limits).ok()?;
+        let img = image::DynamicImage::from_decoder(decoder).ok()?;
+        let (width, height) = (img.width(), img.height());
+        if width <= MAX_ICON_DIMENSION && height <= MAX_ICON_DIMENSION {
+            return None;
+        }
+
+        let max = u64::from(MAX_ICON_DIMENSION);
+        let (target_w, target_h) = if width >= height {
+            let h = ((u64::from(height) * max) / u64::from(width)).max(1) as u32;
+            (MAX_ICON_DIMENSION, h)
+        } else {
+            let w = ((u64::from(width) * max) / u64::from(height)).max(1) as u32;
+            (w, MAX_ICON_DIMENSION)
+        };
+
+        let resized = img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
+        let mut out = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut out);
+        resized
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .ok()?;
+        Some(out)
+    }
+
+    /// Extrae icono desde un archive ya abierto (evita re-abrir el ZIP)
+    fn extract_icon_from_archive(archive: &mut ZipArchive<File>) -> Option<Arc<String>> {
+        for icon_path in &[
+            "pack.png",
+            "fabric.mod.json",
+            "quilt.mod.json",
+            "META-INF/neoforge.mods.toml",
+            "META-INF/mods.toml",
+            "mcmod.info",
+        ] {
+            let names = match *icon_path {
+                "pack.png" => vec!["pack.png".to_string()],
+                "fabric.mod.json" => Self::read_zip_json(archive, icon_path)
+                    .map(|json| Self::icon_paths(&json["icon"]))
+                    .unwrap_or_default(),
+                "quilt.mod.json" => Self::read_zip_json(archive, icon_path)
+                    .map(|json| Self::icon_paths(&json["quilt_loader"]["metadata"]["icon"]))
+                    .unwrap_or_default(),
+                "mcmod.info" => Self::read_zip_json(archive, icon_path)
+                    .map(|json| Self::icon_paths(&Self::legacy_mod(&json)["logoFile"]))
+                    .unwrap_or_default(),
+                path => Self::read_zip_toml(archive, path)
+                    .map(|toml| {
+                        let mut paths = Self::icon_paths(&toml["mods"][0]["logoFile"]);
+                        paths.extend(Self::icon_paths(&toml["logoFile"]));
+                        paths
+                    })
+                    .unwrap_or_default(),
+            };
+            for name in names {
+                let clean = name.trim_start_matches('/');
+                if let Ok(f) = archive.by_name(clean) {
+                    if f.size() > MAX_ICON_FILE_BYTES {
+                        continue;
+                    }
+                    let mut buf = Vec::new();
+                    if f.take(MAX_ICON_FILE_BYTES + 1)
+                        .read_to_end(&mut buf)
+                        .is_ok()
+                        && !buf.is_empty()
+                        && buf.len() as u64 <= MAX_ICON_FILE_BYTES
+                    {
+                        let mime = if clean.ends_with(".png") {
+                            "image/png"
+                        } else if clean.ends_with(".jpg") || clean.ends_with(".jpeg") {
+                            "image/jpeg"
+                        } else if clean.ends_with(".svg") {
+                            "image/svg+xml"
+                        } else {
+                            "image/png"
+                        };
+                        return Some(Arc::new(Self::encode_icon(mime, buf)));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extrae solo el icono, reutilizando el cache combinado
+    pub fn get_mod_icon(path: &Path) -> Option<Arc<String>> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let mtime = (metadata.modified().ok()?, metadata.len());
+        {
+            let mut cache = ADDON_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached_mtime, _, cached_icon)) = cache.get(path)
+                && *cached_mtime == mtime
+            {
+                return cached_icon.clone();
+            }
+        }
+        let (meta, result) = Self::parse_meta_and_icon(path, |archive| {
+            MOD_PARSERS.iter().find_map(|parser| parser(archive).ok())
+        });
+        let mut cache = ADDON_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(path.to_path_buf(), (mtime, meta, result.clone()));
+        result
+    }
+
+    fn icon_paths(value: &serde_json::Value) -> Vec<String> {
+        if let Some(path) = value.as_str() {
+            return vec![path.to_string()];
+        }
+        let Some(sizes) = value.as_object() else {
+            return Vec::new();
+        };
+        let mut paths: Vec<_> = sizes
+            .iter()
+            .filter_map(|(size, path)| Some((size.parse::<u32>().ok()?, path.as_str()?)))
+            .collect();
+        paths.sort_by_key(|(size, _)| size.abs_diff(128));
+        paths
+            .into_iter()
+            .map(|(_, path)| path.to_string())
+            .collect()
+    }
+
+    /// Catalog scans persist this metadata on disk; icon extraction is deferred
+    /// until the UI requests the visible files.
+    pub fn get_mod_metadata_only(path: &Path) -> Option<AddonMetaNoIcon> {
+        let mut archive = ZipArchive::new(File::open(path).ok()?).ok()?;
+        MOD_PARSERS
+            .iter()
+            .find_map(|parser| parser(&mut archive).ok())
+    }
+
+    /// Parse both metadata and icon from a ZIP in one pass (resourcepacks)
+    pub fn get_resourcepack_info_full(
+        path: &Path,
+    ) -> (Option<AddonMetaNoIcon>, Option<Arc<String>>) {
+        let mtime =
+            match std::fs::metadata(path).and_then(|m| m.modified().map(|time| (time, m.len()))) {
+                Ok(m) => m,
+                Err(_) => return (None, None),
+            };
+        {
+            let mut cache = ADDON_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached_mtime, meta, icon)) = cache.get(path)
+                && *cached_mtime == mtime
+            {
+                return (meta.clone(), icon.clone());
+            }
+        }
+
+        let (meta, icon) = Self::parse_pack_mcmeta_and_icon(path);
+
+        let mut cache = ADDON_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(path.to_path_buf(), (mtime, meta.clone(), icon.clone()));
+
+        (meta, icon)
+    }
+
+    /// Parse both metadata and icon from a ZIP in one pass (shaderpacks)
+    pub fn get_shaderpack_info_full(path: &Path) -> (Option<AddonMetaNoIcon>, Option<Arc<String>>) {
+        if path.extension().is_some_and(|ext| ext == "txt") {
+            return (None, None);
+        }
+        let mtime =
+            match std::fs::metadata(path).and_then(|m| m.modified().map(|time| (time, m.len()))) {
+                Ok(m) => m,
+                Err(_) => return (None, None),
+            };
+        {
+            let mut cache = ADDON_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached_mtime, meta, icon)) = cache.get(path)
+                && *cached_mtime == mtime
+            {
+                return (meta.clone(), icon.clone());
+            }
+        }
+
+        let (meta, icon) = Self::parse_pack_mcmeta_and_icon(path);
+
+        let mut cache = ADDON_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(path.to_path_buf(), (mtime, meta.clone(), icon.clone()));
+
+        (meta, icon)
+    }
+
+    fn parse_pack_mcmeta_and_icon(path: &Path) -> (Option<AddonMetaNoIcon>, Option<Arc<String>>) {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                debug!("Could not open {:?}: {}", path, e);
+                return (None, None);
+            }
+        };
+        let mut archive = match ZipArchive::new(file) {
+            Ok(a) => a,
+            Err(e) => {
+                debug!("Could not read ZIP {:?}: {}", path, e);
+                return (None, None);
+            }
+        };
+
+        let meta = Self::parse_pack_mcmeta_inner(&mut archive, path);
+        let icon = Self::extract_icon_from_archive(&mut archive);
+        (meta, icon)
+    }
+
+    fn parse_pack_mcmeta_inner(
+        archive: &mut ZipArchive<File>,
+        path: &Path,
+    ) -> Option<AddonMetaNoIcon> {
+        let json: serde_json::Value = {
+            let mut file = archive.by_name("pack.mcmeta").ok()?;
+            let mut content = String::new();
+            file.read_to_string(&mut content).ok()?;
+            serde_json::from_str(&content).ok()?
+        };
+
+        let description = json["pack"]["description"]
+            .as_str()
+            .or_else(|| json["pack"]["description"]["text"].as_str())
+            .map(|s| s.to_string());
+
+        let name = path.file_stem()?.to_string_lossy().to_string();
+
+        Some(AddonMetaNoIcon {
+            name,
+            version: None,
+            description,
+            authors: None,
+        })
+    }
+
+    fn read_mod_text(archive: &mut ZipArchive<File>, path: &str) -> Result<String, ()> {
+        let file = archive.by_name(path).map_err(|_| ())?;
+        if file.size() > MAX_MOD_METADATA_BYTES {
+            return Err(());
+        }
+        let mut content = String::new();
+        file.take(MAX_MOD_METADATA_BYTES + 1)
+            .read_to_string(&mut content)
+            .map_err(|_| ())?;
+        if content.len() as u64 > MAX_MOD_METADATA_BYTES {
+            return Err(());
+        }
+        Ok(content)
+    }
+
+    fn read_zip_json(archive: &mut ZipArchive<File>, path: &str) -> Result<serde_json::Value, ()> {
+        serde_json::from_str(&Self::read_mod_text(archive, path)?).map_err(|_| ())
+    }
+
+    fn read_zip_toml(archive: &mut ZipArchive<File>, path: &str) -> Result<serde_json::Value, ()> {
+        let content = Self::read_mod_text(archive, path)?;
+        let toml_val: toml::Value = toml::from_str(&content).map_err(|_| ())?;
+        serde_json::to_value(toml_val).map_err(|_| ())
+    }
+
+    fn try_parse_fabric(archive: &mut ZipArchive<File>) -> Result<AddonMetaNoIcon, ()> {
+        let json = Self::read_zip_json(archive, "fabric.mod.json")?;
+        let name = json["name"]
+            .as_str()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| json["id"].as_str())
+            .ok_or(())?
+            .to_string();
+        let version = json["version"].as_str().map(|s| s.to_string());
+        let description = json["description"].as_str().map(|s| s.to_string());
+
+        let authors = json.get("authors").and_then(|v| {
+            v.as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a.as_str().or_else(|| a["name"].as_str()).map(String::from))
+                        .collect()
+                })
+                .or_else(|| v.as_str().map(|s| vec![s.to_string()]))
+        });
+
+        Ok(AddonMetaNoIcon {
+            name,
+            version,
+            description,
+            authors,
+        })
+    }
+
+    fn try_parse_quilt(archive: &mut ZipArchive<File>) -> Result<AddonMetaNoIcon, ()> {
+        let json = Self::read_zip_json(archive, "quilt.mod.json")?;
+        let metadata = json
+            .get("quilt_loader")
+            .and_then(|ql| ql.get("metadata"))
+            .unwrap_or(&json);
+
+        let name = metadata["name"]
+            .as_str()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| json["quilt_loader"]["id"].as_str())
+            .ok_or(())?
+            .to_string();
+        let version = json
+            .get("quilt_loader")
+            .and_then(|ql| ql["version"].as_str())
+            .map(|s| s.to_string());
+        let description = metadata["description"].as_str().map(|s| s.to_string());
+        let authors = metadata
+            .get("contributors")
+            .and_then(|c| c.as_object())
+            .map(|map| map.keys().cloned().collect());
+
+        Ok(AddonMetaNoIcon {
+            name,
+            version,
+            description,
+            authors,
+        })
+    }
+
+    fn try_parse_forge_modern(archive: &mut ZipArchive<File>) -> Result<AddonMetaNoIcon, ()> {
+        FORGE_METADATA
+            .iter()
+            .find_map(|path| {
+                let toml = Self::read_zip_toml(archive, path).ok()?;
+                Self::parse_forge_metadata(&toml).ok()
+            })
+            .ok_or(())
+    }
+
+    fn parse_forge_metadata(toml_val: &serde_json::Value) -> Result<AddonMetaNoIcon, ()> {
+        let first_mod = toml_val
+            .get("mods")
+            .and_then(|m| m.as_array())
+            .and_then(|a| a.first())
+            .ok_or(())?;
+
+        let name = first_mod
+            .get("displayName")
+            .and_then(|v| v.as_str())
+            .or_else(|| first_mod.get("modId").and_then(|v| v.as_str()))
+            .ok_or(())?
+            .to_string();
+
+        let version = first_mod
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let description = first_mod
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let authors = first_mod
+            .get("authors")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()]);
+
+        Ok(AddonMetaNoIcon {
+            name,
+            version,
+            description,
+            authors,
+        })
+    }
+
+    fn legacy_mod(json: &serde_json::Value) -> &serde_json::Value {
+        json.as_array()
+            .and_then(|a| a.first())
+            .or_else(|| json.get("modList").and_then(|m| m.as_array())?.first())
+            .unwrap_or(json)
+    }
+
+    fn try_parse_forge_legacy(archive: &mut ZipArchive<File>) -> Result<AddonMetaNoIcon, ()> {
+        let json = Self::read_zip_json(archive, "mcmod.info")?;
+        let mod_data = Self::legacy_mod(&json);
+
+        let name = mod_data["name"].as_str().ok_or(())?.to_string();
+        let version = mod_data["version"].as_str().map(|s| s.to_string());
+        let description = mod_data["description"].as_str().map(|s| s.to_string());
+        let authors = mod_data["authorList"].as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+
+        Ok(AddonMetaNoIcon {
+            name,
+            version,
+            description,
+            authors,
+        })
+    }
+}

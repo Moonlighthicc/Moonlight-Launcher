@@ -1,0 +1,382 @@
+<script lang="ts">
+	import { onDestroy } from "svelte";
+	import { isPackProtected } from "$lib/utils/modpackMods";
+	import {
+		getInstanceMods,
+		toggleInstanceMod,
+		deleteInstanceFile,
+	} from "$lib/api/cubicApi";
+	import { type ModDto } from "$lib/types/types";
+	import { t } from "$lib/i18n";
+	import ModalBase from "../../layout/ModalBase.svelte";
+	import { SvelteSet } from "svelte/reactivity";
+	import Trash from "$lib/icons/Trash.svelte";
+	import Lupa from "$lib/icons/Lupa.svelte";
+	import ModCard from "./ModCard.svelte";
+
+	let { instanceId }: { instanceId: string } = $props();
+	let mods = $state<ModDto[]>([]);
+	let selected = new SvelteSet<string>();
+	let searchQuery = $state("");
+	let loading = $state(true);
+	let error = $state("");
+	let generation = 0;
+	let disposed = false;
+	onDestroy(() => {
+		disposed = true;
+		generation++;
+	});
+	let bulkDeleteModal = $state(false);
+
+	const normalizedSearchQuery = $derived(searchQuery.trim().toLowerCase());
+
+	let filteredMods = $derived.by(() => {
+		if (!normalizedSearchQuery) return mods;
+		return mods.filter(
+			(mod) =>
+				mod.name.toLowerCase().includes(normalizedSearchQuery) ||
+				(mod.description &&
+					mod.description
+						.toLowerCase()
+						.includes(normalizedSearchQuery)) ||
+				(mod.authors &&
+					mod.authors.some((a) =>
+						a.toLowerCase().includes(normalizedSearchQuery),
+					)),
+		);
+	});
+
+	$effect(() => {
+		const id = instanceId;
+		mods = [];
+		selected.clear();
+		bulkDeleteModal = false;
+		void loadMods(id);
+		return () => {
+			generation++;
+		};
+	});
+
+	async function loadMods(id: string) {
+		const request = ++generation;
+		loading = true;
+		error = "";
+		try {
+			const result = await getInstanceMods(id);
+			if (!disposed && request === generation) mods = result;
+		} catch (e) {
+			if (!disposed && request === generation) error = String(e);
+		} finally {
+			if (!disposed && request === generation) loading = false;
+		}
+	}
+
+	function toggleSelect(filename: string) {
+		if (isPackProtected(mods.find((mod) => mod.filename === filename)))
+			return;
+		if (selected.has(filename)) {
+			selected.delete(filename);
+		} else {
+			selected.add(filename);
+		}
+	}
+
+	async function handleToggle(mod: ModDto) {
+		if (isPackProtected(mod)) return;
+		const id = instanceId;
+		const request = generation;
+		try {
+			await toggleInstanceMod(id, mod.filename, !mod.enabled);
+			if (!disposed && request === generation) await loadMods(id);
+		} catch (e) {
+			if (!disposed && request === generation) error = String(e);
+		}
+	}
+
+	async function handleBulkDelete() {
+		const count = selected.size;
+		if (count === 0) return;
+		const id = instanceId;
+		const request = generation;
+		try {
+			for (const filename of [...selected]) {
+				if (disposed || request !== generation) return;
+				if (
+					isPackProtected(
+						mods.find((mod) => mod.filename === filename),
+					)
+				)
+					continue;
+				await deleteInstanceFile(id, "mods", filename);
+			}
+			if (disposed || request !== generation) return;
+			selected.clear();
+			bulkDeleteModal = false;
+			await loadMods(id);
+		} catch (e) {
+			if (!disposed && request === generation) error = String(e);
+		}
+	}
+</script>
+
+<div class="mods-section">
+	{#if error}<p role="alert">{error}</p>{/if}
+	<div class="section-header">
+		<span class="section-title"
+			>{t("instanceView.mods.title")} ({mods.length})</span
+		>
+		<div class="search-bar">
+			<Lupa width="20" height="20" />
+			<input
+				type="text"
+				disabled={mods.length === 0}
+				placeholder={t("instanceView.mods.searchPlaceholder")}
+				bind:value={searchQuery}
+			/>
+		</div>
+		<div class="selection-actions">
+			<span class="selection-count">{selected.size}</span>
+			<button
+				type="button"
+				class="delete-selected-btn"
+				disabled={selected.size == 0}
+				onclick={() => {
+					bulkDeleteModal = true;
+				}}
+			>
+				<Trash width="14" height="14" />
+
+				{t("instanceView.deleteSelected")}
+			</button>
+		</div>
+	</div>
+	{#if loading && mods.length === 0}
+		<div class="mods-skeleton sk-delayed" aria-hidden="true">
+			{#each { length: 6 } as _, index (index)}
+				<div class="mod-skeleton-card">
+					<span
+						class="sk-block"
+						style="width: 44px; height: 44px; flex-shrink: 0;"
+					></span>
+					<div class="sk-stack mod-skeleton-text">
+						<span class="sk-block sk-line" style="width: 62%"
+						></span>
+						<span
+							class="sk-block sk-line sk-line-sm"
+							style="width: 88%"
+						></span>
+						<span
+							class="sk-block sk-line sk-line-sm"
+							style="width: 42%"
+						></span>
+					</div>
+					<span class="sk-block mod-skeleton-toggle"></span>
+				</div>
+			{/each}
+		</div>
+		<span class="sk-sr-only" role="status">{t("common.loading")}</span>
+	{:else}
+		<div class="mods-grid">
+			{#each filteredMods as mod (mod.filename)}
+				<ModCard
+					{mod}
+					isSelected={selected.has(mod.filename)}
+					onToggleSelect={toggleSelect}
+					onToggleEnable={handleToggle}
+				/>
+			{/each}
+			{#if mods.length === 0}
+				<div class="empty-mods">
+					{t("instanceView.mods.empty")}
+				</div>
+			{/if}
+		</div>
+	{/if}
+</div>
+<ModalBase bind:open={bulkDeleteModal} title={t("sidebar.modals.deleteTitle")}>
+	<p class="confirmation-message">
+		{t("instanceView.mods.bulkDelete")}
+	</p>
+	{#snippet footer()}
+		<button
+			type="button"
+			class="btn-secondary"
+			onclick={() => (bulkDeleteModal = false)}
+			>{t("sidebar.modals.cancel")}</button
+		>
+		<button
+			type="button"
+			class="btn-primary"
+			style="background: var(--color-error); color: var(--color-on-error);"
+			onclick={handleBulkDelete}>{t("sidebar.modals.deleteBtn")}</button
+		>
+	{/snippet}
+</ModalBase>
+
+<style>
+	.mods-section {
+		margin-bottom: 24px;
+	}
+
+	.section-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 12px;
+	}
+
+	.section-title {
+		font-size: 1.2rem;
+		font-weight: 600;
+		color: var(--text-primary);
+	}
+
+	.selection-actions {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.selection-count {
+		font-size: 0.75rem;
+		font-weight: 700;
+		color: var(--accent);
+		background: rgba(var(--surface-rgb), 0.05);
+		border: 1px solid var(--border);
+		padding: 1px 8px;
+		border-radius: var(--border-radius-sm);
+	}
+
+	.delete-selected-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 6px 12px;
+		background: rgba(var(--color-error-rgb), 0.1);
+		border: 1px solid rgba(var(--color-error-rgb), 0.25);
+		color: var(--color-error);
+		border-radius: var(--border-radius-sm);
+		cursor: pointer;
+		font-size: 0.78rem;
+		font-weight: 700;
+		transition: all 0.2s;
+	}
+
+	.delete-selected-btn:disabled {
+		background: rgba(var(--surface-rgb), 0.05);
+		border-color: rgba(var(--surface-rgb), 0.1);
+		color: rgba(var(--surface-rgb), 0.35);
+		cursor: not-allowed;
+		opacity: 0.6;
+	}
+
+	.delete-selected-btn:not(:disabled):hover {
+		background: rgba(var(--color-error-rgb), 0.2);
+		border-color: rgba(var(--color-error-rgb), 0.4);
+	}
+
+	.mods-grid,
+	.mods-skeleton {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+		gap: 12px;
+		padding: 4px;
+	}
+
+	.mod-skeleton-card {
+		display: flex;
+		align-items: flex-start;
+		gap: 10px;
+		padding: 14px;
+		border: 1px solid var(--border);
+		border-radius: var(--border-radius-sm);
+		background: var(--surface-selected);
+		min-width: 0;
+	}
+
+	.mod-skeleton-toggle {
+		width: 32px;
+		height: 18px;
+		margin-left: auto;
+		flex-shrink: 0;
+		border-radius: 999px;
+	}
+
+	.mod-skeleton-text {
+		flex: 1;
+		gap: 8px;
+		padding-top: 2px;
+	}
+
+	.empty-mods {
+		grid-column: 1 / -1;
+		text-align: center;
+		padding: 40px;
+		color: var(--text-secondary);
+		font-size: 0.85rem;
+		background: rgba(var(--surface-rgb), 0.02);
+		border: 1px dashed var(--border);
+		border-radius: var(--border-radius-sm);
+		text-transform: uppercase;
+		letter-spacing: 1px;
+	}
+	.search-bar {
+		flex: 0 0 250px;
+		position: relative;
+		display: flex;
+		align-items: center;
+	}
+
+	.search-bar :global(.icon-svg) {
+		position: absolute;
+		left: 10px;
+		pointer-events: none;
+		color: var(--text-secondary);
+		opacity: 0.5;
+		z-index: 1;
+	}
+
+	.search-bar input {
+		width: 100%;
+		padding: 8px 12px 8px 36px;
+		background: rgba(var(--surface-rgb), 0.05);
+		border: 1px solid var(--border);
+		border-radius: var(--border-radius-sm);
+		color: var(--text-primary);
+		font-size: 0.85rem;
+		outline: none;
+		transition: all 0.2s;
+	}
+
+	.search-bar input:focus {
+		border-color: var(--accent);
+		background: var(--surface-hover);
+	}
+
+	.search-bar input::placeholder {
+		color: var(--text-secondary);
+		opacity: 0.6;
+	}
+	@media (max-width: 700px) {
+		.mods-grid,
+		.mods-skeleton {
+			grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+		}
+	}
+
+	@media (max-width: 550px) {
+		.mods-grid,
+		.mods-skeleton {
+			grid-template-columns: 1fr;
+			gap: 8px;
+		}
+	}
+
+	@media (max-width: 400px) {
+		.mods-grid,
+		.mods-skeleton {
+			grid-template-columns: 1fr;
+			gap: 6px;
+		}
+	}
+</style>

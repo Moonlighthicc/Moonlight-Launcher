@@ -1,0 +1,369 @@
+//! Exportación de instancias de moonlauncher a un ZIP compatible con
+//! MultiMC / PolyMC / Prism Launcher.
+//!
+//! El archivo generado contiene:
+//! - `instance.cfg`        metadatos de la instancia (nombre, memoria, icono).
+//! - `mmc-pack.json`       componentes de Minecraft + loader.
+//! - `.minecraft/`         directorio de juego (mods, saves, resourcepacks, etc.).
+//! - `icon.png`            icono personalizado de la instancia, si existe.
+//! - `cubic-manifest.json` metadatos extra propios de moonlauncher.
+
+use crate::services::InstOverrides;
+use crate::services::instance_manager::InstanceHandle;
+use crate::services::modpack::{self, PackState};
+use serde::Serialize;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use tracing::{info, warn};
+use zellkern::{GameVersion, Loader};
+
+/// Carpetas/archivos del directorio de juego que se incluyen en el ZIP.
+const GAME_DATA_ENTRIES: &[&str] = &[
+    "mods",
+    "resourcepacks",
+    "texturepacks",
+    "shaderpacks",
+    "saves",
+    "screenshots",
+    "config",
+    "scripts",
+    "defaultconfigs",
+    "kubejs",
+    "data",
+    "options.txt",
+    "optionsof.txt",
+    "servers.dat",
+];
+
+/// Datos recolectados de la instancia antes de comprimir en un hilo aparte.
+pub struct ExportInput {
+    pub uuid: String,
+    pub name: String,
+    pub version_id: String,
+    pub mc_version: String,
+    pub loader_name: String,
+    pub loader_version: Option<String>,
+    pub loader_mmc_uid: Option<&'static str>,
+    pub instance_dir: PathBuf,
+    pub min_memory: u32,
+    pub max_memory: u32,
+    pub overrides: Option<InstOverrides>,
+    pub minecraft_jar: super::minecraft_jar::MinecraftJarConfig,
+    pub modpack: Option<PackState>,
+    pub icon_src: Option<PathBuf>,
+}
+
+/// Prepara la información necesaria para exportar una instancia.
+pub async fn prepare_export(handle: &InstanceHandle) -> Result<ExportInput, String> {
+    let name = handle.get_name().await.to_string();
+    let version_id = handle.get_version().await.to_string();
+    let instance_dir = handle.get_instance_dir().await;
+    let modpack = modpack::read_state(&instance_dir).await?;
+    let min_memory = handle.get_min_memory().await;
+    let max_memory = handle.get_max_memory().await;
+    let overrides = handle.get_overrides().await;
+    let uuid = handle.uuid.to_string();
+
+    let icon_src = handle.get_icon_absolute().await.and_then(|abs| {
+        let path = PathBuf::from(abs.as_ref());
+        path.is_file().then_some(path)
+    });
+
+    let game_version = GameVersion::from_version_id(&version_id);
+    let loader_name = game_version.loader.name().to_string();
+    let loader_version = game_version.loader.version().map(|s| s.to_string());
+    let loader_mmc_uid = loader_to_mmc_uid(&game_version.loader);
+    let mc_version = game_version.mc_version;
+
+    Ok(ExportInput {
+        uuid,
+        name,
+        version_id,
+        mc_version,
+        loader_name,
+        loader_version,
+        loader_mmc_uid,
+        instance_dir,
+        min_memory,
+        max_memory,
+        overrides,
+        minecraft_jar: handle.get_minecraft_jar().await,
+        modpack,
+        icon_src,
+    })
+}
+
+/// Genera el ZIP en la ruta indicada.
+pub fn export_to_zip(input: &ExportInput, dest: &Path) -> Result<PathBuf, String> {
+    input.minecraft_jar.validate()?;
+    if let Some(state) = &input.modpack {
+        if state.schema_version != 1 {
+            return Err("Unsupported modpack registry version".into());
+        }
+        for relative in state.files.keys() {
+            modpack::valid_path(relative)?;
+        }
+    }
+    info!(
+        "Exporting instance '{}' to '{}'",
+        input.name,
+        dest.display()
+    );
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Could not create the destination directory: {e}"))?;
+    }
+
+    let file =
+        std::fs::File::create(dest).map_err(|e| format!("Could not create the ZIP file: {e}"))?;
+
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let manifest = build_cubic_manifest(input);
+    write_zip_file(
+        &mut zip,
+        "cubic-manifest.json",
+        manifest.as_bytes(),
+        options,
+    )?;
+
+    let cfg = build_instance_cfg(input);
+    write_zip_file(&mut zip, "instance.cfg", cfg.as_bytes(), options)?;
+
+    let mmc_pack = build_mmc_pack(input);
+    write_zip_file(&mut zip, "mmc-pack.json", mmc_pack.as_bytes(), options)?;
+
+    if let Some(icon) = &input.icon_src {
+        let data =
+            std::fs::read(icon).map_err(|e| format!("Could not read the icon {:?}: {e}", icon))?;
+        write_zip_file(&mut zip, "icon.png", &data, options)?;
+    }
+
+    zip.add_directory(".minecraft", options)
+        .map_err(|e| format!("Could not add the .minecraft directory: {e}"))?;
+
+    for entry in GAME_DATA_ENTRIES {
+        let src = input.instance_dir.join(entry);
+        if !src.exists() {
+            continue;
+        }
+        let zip_path = PathBuf::from(".minecraft").join(entry);
+        add_path_to_zip(&mut zip, &src, &zip_path, options, true)
+            .map_err(|e| format!("Failed to compress {:?}: {e}", src))?;
+    }
+
+    if let Some(state) = &input.modpack {
+        for relative in state.files.keys() {
+            // Las carpetas habituales ya se incluyen completas, sin duplicar entradas.
+            if GAME_DATA_ENTRIES
+                .iter()
+                .any(|entry| Path::new(relative).starts_with(entry))
+            {
+                continue;
+            }
+            let source = modpack::checked_path(&input.instance_dir, relative)?;
+            // Un archivo eliminado localmente conserva su procedencia, no se recrea.
+            if !source.is_file() {
+                continue;
+            }
+            add_path_to_zip(
+                &mut zip,
+                &source,
+                &PathBuf::from(".minecraft").join(relative),
+                options,
+                true,
+            )
+            .map_err(|e| format!("Failed to compress {:?}: {e}", source))?;
+        }
+    }
+
+    for file in input.minecraft_jar.files() {
+        let relative = PathBuf::from(super::minecraft_jar::INPUT_DIR).join(&file.file);
+        let source = input.instance_dir.join(&relative);
+        super::minecraft_jar::validate_archive(
+            &source,
+            input.minecraft_jar.replacement.as_ref() == Some(file),
+        )?;
+        add_path_to_zip(
+            &mut zip,
+            &source,
+            &PathBuf::from(".minecraft").join(relative),
+            options,
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    zip.finish()
+        .map_err(|e| format!("Failed to finalize ZIP: {e}"))?;
+
+    info!("Instance exported successfully to '{}'", dest.display());
+    Ok(dest.to_path_buf())
+}
+
+fn write_zip_file(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    name: &str,
+    data: &[u8],
+    options: zip::write::SimpleFileOptions,
+) -> Result<(), String> {
+    zip.start_file(name, options)
+        .map_err(|e| format!("Could not start file '{name}' in the ZIP: {e}"))?;
+    zip.write_all(data)
+        .map_err(|e| format!("Could not write '{name}' to the ZIP: {e}"))?;
+    Ok(())
+}
+
+fn add_path_to_zip(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    src: &Path,
+    zip_path: &Path,
+    options: zip::write::SimpleFileOptions,
+    game_data: bool,
+) -> Result<(), std::io::Error> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if metadata.file_type().is_symlink() || !(metadata.is_dir() || metadata.is_file()) {
+        return Ok(());
+    }
+    if game_data {
+        let relative = zip_path.strip_prefix(".minecraft").expect("game path");
+        let relative = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if modpack::valid_path(&relative).is_err() {
+            return Ok(());
+        }
+    }
+    if metadata.is_dir() {
+        zip.add_directory(zip_path.to_string_lossy(), options)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            add_path_to_zip(
+                zip,
+                &entry.path(),
+                &zip_path.join(entry.file_name()),
+                options,
+                game_data,
+            )?;
+        }
+    } else {
+        zip.start_file(zip_path.to_string_lossy(), options)?;
+        let data = std::fs::read(src)?;
+        zip.write_all(&data)?;
+    }
+    Ok(())
+}
+
+fn build_instance_cfg(input: &ExportInput) -> String {
+    let mut lines = vec!["[General]".to_string(), format!("name={}", input.name)];
+
+    if input.icon_src.is_some() {
+        lines.push("iconKey=icon".to_string());
+    }
+
+    lines.push(format!("MinMemAlloc={}", input.min_memory));
+    lines.push(format!("MaxMemAlloc={}", input.max_memory));
+
+    // Preserva los argumentos JVM por instancia al exportar para MultiMC/Prism.
+    if let Some(args) = input
+        .overrides
+        .as_ref()
+        .and_then(|o| o.jvm_args.as_ref())
+        .filter(|args| !args.is_empty())
+    {
+        lines.push("OverrideJavaArgs=true".to_string());
+        lines.push(format!("JvmArgs={}", args.join(" ")));
+    }
+
+    lines.join("\n") + "\n"
+}
+
+#[derive(Serialize)]
+struct MmcComponent {
+    uid: &'static str,
+    version: String,
+}
+
+#[derive(Serialize)]
+struct MmcPack {
+    components: Vec<MmcComponent>,
+}
+
+fn build_mmc_pack(input: &ExportInput) -> String {
+    let mut components = vec![MmcComponent {
+        uid: "net.minecraft",
+        version: input.mc_version.clone(),
+    }];
+
+    if let Some(uid) = input.loader_mmc_uid {
+        if let Some(version) = &input.loader_version {
+            components.push(MmcComponent {
+                uid,
+                version: version.clone(),
+            });
+        } else {
+            warn!(
+                "Loader '{}' has no version for instance '{}', exporting as Vanilla",
+                input.loader_name, input.name
+            );
+        }
+    }
+
+    serde_json::to_string_pretty(&MmcPack { components }).expect("mmc-pack.json serializable")
+}
+
+#[derive(Serialize)]
+struct CubicManifest {
+    format_version: u8,
+    exported_by: &'static str,
+    uuid: String,
+    name: String,
+    version_id: String,
+    mc_version: String,
+    loader: String,
+    loader_version: Option<String>,
+    min_memory: u32,
+    max_memory: u32,
+    overrides: Option<InstOverrides>,
+    minecraft_jar: super::minecraft_jar::MinecraftJarConfig,
+    modpack: Option<PackState>,
+}
+
+fn build_cubic_manifest(input: &ExportInput) -> String {
+    let manifest = CubicManifest {
+        format_version: 1,
+        exported_by: "moonlauncher",
+        uuid: input.uuid.clone(),
+        name: input.name.clone(),
+        version_id: input.version_id.clone(),
+        mc_version: input.mc_version.clone(),
+        loader: input.loader_name.clone(),
+        loader_version: input.loader_version.clone(),
+        min_memory: input.min_memory,
+        max_memory: input.max_memory,
+        overrides: input.overrides.clone(),
+        minecraft_jar: input.minecraft_jar.clone(),
+        modpack: input.modpack.clone(),
+    };
+
+    serde_json::to_string_pretty(&manifest).expect("manifest serializable")
+}
+
+fn loader_to_mmc_uid(loader: &Loader) -> Option<&'static str> {
+    match loader {
+        Loader::Vanilla | Loader::OptiFine(_) => None,
+        Loader::Fabric(_) => Some("net.fabricmc.fabric-loader"),
+        Loader::Forge(_) => Some("net.minecraftforge"),
+        Loader::NeoForge(_) => Some("net.neoforged"),
+        Loader::Quilt(_) => Some("org.quiltmc.quilt-loader"),
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/services/instance_export.rs"]
+mod tests;

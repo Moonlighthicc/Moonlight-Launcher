@@ -1,0 +1,147 @@
+use crate::core::http_client::HTTP;
+use crate::core::sanitize::redact_log_line;
+use crate::core::webview::secondary_window_config;
+use crate::services::launcher::{LogLine, get_log_history};
+use dashmap::DashMap;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, OnceLock};
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+
+static LOG_WINDOWS: OnceLock<DashMap<String, String>> = OnceLock::new();
+static PREVIEWS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn wants_log_preview(instance_id: &str) -> bool {
+    PREVIEWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .any(|id| id == instance_id)
+}
+
+pub(crate) fn clear_log_previews() {
+    PREVIEWS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+#[tauri::command]
+pub fn set_log_preview(
+    window: tauri::WebviewWindow,
+    subscription_id: String,
+    instance_id: Option<String>,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("Log previews belong to the main window".into());
+    }
+    super::instance::launch::validate_uuid(&subscription_id)?;
+    let mut previews = PREVIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(id) = instance_id {
+        super::instance::launch::validate_uuid(&id)?;
+        previews.insert(subscription_id, id);
+    } else {
+        // Each mount owns its token: late cleanup cannot remove a newer header.
+        previews.remove(&subscription_id);
+    }
+    Ok(())
+}
+
+fn remove_log_window(instance_id: &str) {
+    if let Some(map) = LOG_WINDOWS.get() {
+        map.remove(instance_id);
+    }
+}
+
+/// The console trims its buffer to this many lines anyway, so sending the
+/// whole ring only inflates the IPC payload.
+const LOG_HISTORY_DEFAULT: usize = 3000;
+
+#[tauri::command]
+pub async fn get_log_history_cmd(instance_id: String, limit: Option<usize>) -> Vec<LogLine> {
+    get_log_history(&instance_id, limit.or(Some(LOG_HISTORY_DEFAULT))).await
+}
+
+/// Abre la ventana de logs de una instancia. Puede llamarse tanto desde
+/// comandos Tauri como directamente desde el backend.
+pub async fn open_log_window_for_instance(
+    app: AppHandle,
+    instance_id: String,
+    instance_name: String,
+) -> Result<(), String> {
+    let label = format!("log-{}", instance_id);
+
+    let map = LOG_WINDOWS.get_or_init(DashMap::new);
+    if let Some(existing) = map.get(&instance_id)
+        && let Some(w) = app.get_webview_window(existing.value())
+    {
+        let _ = w.set_focus();
+        return Ok(());
+    }
+
+    let encoded_id = urlencoding::encode(&instance_id);
+    let encoded_name = urlencoding::encode(&instance_name);
+    let path = format!("/?log={}&name={}", encoded_id, encoded_name);
+
+    let window_config =
+        secondary_window_config(app.config(), &label, WebviewUrl::App(path.into()))?;
+    let window = WebviewWindowBuilder::from_config(&app, &window_config)
+        .map_err(|e| e.to_string())?
+        .title(format!("Logs — {}", instance_name))
+        .inner_size(800.0, 500.0)
+        .min_inner_size(400.0, 300.0)
+        .resizable(true)
+        .decorations(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let id = instance_id.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { .. } = event {
+            remove_log_window(&id);
+        }
+    });
+
+    map.insert(instance_id, label);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn open_log_window(
+    app: AppHandle,
+    instance_id: String,
+    instance_name: String,
+) -> Result<(), String> {
+    open_log_window_for_instance(app, instance_id, instance_name).await
+}
+
+#[tauri::command]
+pub async fn upload_log_to_mclogs(content: String) -> Result<String, String> {
+    // El contenido llega desde el WebView, así que no se confía en que el
+    // LogRing ya lo haya limpiado: un log antiguo, una línea pegada a mano o
+    // una ruta distinta podrían publicar un JWT en un servicio externo.
+    let content = redact_log_line(&content);
+    if content.trim().is_empty() {
+        return Err("There is no content to upload".to_string());
+    }
+    let resp = HTTP
+        .post("https://api.mclo.gs/1/log")
+        .form(&[("content", content.as_ref())])
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to read the response: {}", e))?;
+
+    if json["success"] == true {
+        json["url"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| "URL not found in the response".to_string())
+    } else {
+        Err(json["error"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string())
+    }
+}

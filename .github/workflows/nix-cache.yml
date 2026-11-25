@@ -1,0 +1,222 @@
+name: Nix Binary Cache
+
+on:
+    release:
+        types: [published]
+    # Releases published with GITHUB_TOKEN do not emit another workflow event.
+    workflow_run:
+        workflows: ["Publish Release"]
+        types: [completed]
+    workflow_dispatch:
+        inputs:
+            channel:
+                description: Which release channel to build and publish
+                required: true
+                type: choice
+                options:
+                    - release
+                    - beta
+                    - both
+                default: both
+
+concurrency:
+    group: nix-release-channels
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+env:
+    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+    resolve:
+        runs-on: ubuntu-24.04
+        outputs:
+            channels: ${{ steps.releases.outputs.result }}
+        steps:
+            - name: Check cache configuration
+              env:
+                  CACHIX_CACHE_NAME: ${{ vars.CACHIX_CACHE_NAME }}
+              run: |
+                  if [ -z "$CACHIX_CACHE_NAME" ]; then
+                      echo "::error::Set CACHIX_CACHE_NAME under Settings > Secrets and variables > Actions > Variables (repository variable, not secret)."
+                      exit 1
+                  fi
+
+            - name: Find latest published stable and beta
+              id: releases
+              uses: actions/github-script@v7
+              env:
+                  CHANNEL_SELECTION: ${{ inputs.channel || 'both' }}
+              with:
+                  script: |
+                      const releases = await github.paginate(github.rest.repos.listReleases, {
+                        ...context.repo, per_page: 100
+                      });
+                      const published = releases.filter(r => !r.draft)
+                        .sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at));
+                      const channels = [];
+                      const selection = process.env.CHANNEL_SELECTION;
+                      const requested = selection === 'release'
+                        ? [['latest-release', false]]
+                        : selection === 'beta'
+                          ? [['latest-beta', true]]
+                          : [['latest-release', false], ['latest-beta', true]];
+                      for (const [name, prerelease] of requested) {
+                        const release = published.find(r => r.prerelease === prerelease);
+                        if (!release) continue;
+                        const {data: commit} = await github.rest.repos.getCommit({
+                          ...context.repo, ref: `refs/tags/${release.tag_name}`
+                        });
+                        core.info(`${name}: ${release.tag_name} -> ${commit.sha}`);
+                        channels.push({name, sha: commit.sha, tag: release.tag_name});
+                      }
+                      if (channels.length === 0) {
+                        core.setFailed('No published releases found. Publish a release or prerelease first; drafts are excluded.');
+                      }
+                      return channels;
+
+    build:
+        needs: resolve
+        if: needs.resolve.outputs.channels != '[]'
+        name: Publish (${{ matrix.channel.name }}, ${{ matrix.platform.system }})
+        runs-on: ${{ matrix.platform.runner }}
+        timeout-minutes: 120
+        strategy:
+            fail-fast: false
+            matrix:
+                # Publish only the Linux platforms supported by the flake.
+                channel: ${{ fromJSON(needs.resolve.outputs.channels) }}
+                platform:
+                    - system: x86_64-linux
+                      runner: ubuntu-24.04
+                    - system: aarch64-linux
+                      runner: ubuntu-24.04-arm
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: ${{ matrix.channel.sha }}
+
+            - name: Reuse current Nix packaging
+              # Release tags cut before the packaging fix ship a stale
+              # dist/nix/package.nix. Overlay the current one, but keep the
+              # tag's cargoHash and version: the vendored Cargo.lock must
+              # match the tag's Cargo.lock, even if only the root package
+              # version differs.
+              run: |
+                  tag_cargo_hash="$(sed -n 's/^  cargoHash = "\(.*\)";$/\1/p' dist/nix/package.nix)"
+                  src_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -n 1)"
+
+                  test -n "$tag_cargo_hash" || {
+                      echo "::error::Could not read cargoHash from the release tag's dist/nix/package.nix"
+                      exit 1
+                  }
+                  test -n "$src_version" || {
+                      echo "::error::Could not read version from src-tauri/Cargo.toml"
+                      exit 1
+                  }
+
+                  git fetch --no-tags --depth=1 origin \
+                    "${{ github.event.repository.default_branch }}"
+                  git checkout FETCH_HEAD -- dist/nix/package.nix
+
+                  sed -i "s|^  cargoHash = \".*\";$|  cargoHash = \"$tag_cargo_hash\";|" dist/nix/package.nix
+                  sed -i "s|^  version = \".*\";$|  version = \"$src_version\";|" dist/nix/package.nix
+
+                  echo "Using cargoHash from ${{ matrix.channel.tag }}: $tag_cargo_hash"
+                  echo "Using version from ${{ matrix.channel.tag }}: $src_version"
+
+            - name: Check Cachix credentials
+              env:
+                  CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+              run: |
+                  if [ -z "$CACHIX_AUTH_TOKEN" ]; then
+                      echo "::error::Configure the CACHIX_AUTH_TOKEN repository secret with a write token for the cache."
+                      exit 1
+                  fi
+
+            - name: Install Nix
+              uses: cachix/install-nix-action@v31
+              with:
+                  extra_nix_config: |
+                      experimental-features = nix-command flakes
+
+            - name: Configure Cachix
+              uses: cachix/cachix-action@v17
+              with:
+                  name: ${{ vars.CACHIX_CACHE_NAME }}
+                  authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+            - name: Check packaging before compiling Rust
+              # Use the selected tag's actual hooks with a tiny executable.
+              # Keep this inline so it also checks older tags without this workflow.
+              run: |
+                  # Nix expands the expressions; the shell must leave them untouched.
+                  # shellcheck disable=SC2016
+                  nix build --impure --no-link --print-build-logs --expr '
+                    let
+                      flake = builtins.getFlake "git+file://${toString ./.}";
+                      pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
+                      app = flake.packages.${builtins.currentSystem}.default;
+                      probe = pkgs.writeShellScript "moonlauncher-probe" "
+                        test \"$CUBIC_WRAPPER_CHECK\" = 1 || exit 1
+                        test -n \"$GIO_EXTRA_MODULES\" || exit 1
+                        test \"$#\" = 2 || exit 1
+                        test \"$1\" = \"argument with spaces\" || exit 1
+                        test -z \"$2\" || exit 1
+                      ";
+                    in pkgs.stdenv.mkDerivation {
+                      name = "moonlauncher-wrapper-check";
+                      dontUnpack = true;
+                      strictDeps = true;
+                      nativeBuildInputs = builtins.filter
+                        (p: builtins.elem p [ pkgs.makeWrapper pkgs.wrapGAppsHook4 ])
+                        app.nativeBuildInputs;
+                      buildInputs = app.buildInputs;
+                      installPhase = "mkdir -p $out/bin; cp ${probe} $out/bin/moonlauncher";
+                      preFixup = app.preFixup or "";
+                      postFixup = (app.postFixup or "") + "\n
+                        CUBIC_WRAPPER_CHECK=1 timeout 10 \\
+                          \"$out/bin/moonlauncher\" \"argument with spaces\" \"\"
+                      ";
+                    }
+                  '
+
+            - name: Build launcher
+              run: nix build --print-build-logs ".#packages.${{ matrix.platform.system }}.default"
+
+            # Explicitly publish the closure even when the output was substituted.
+            - name: Publish launcher
+              env:
+                  CACHIX_CACHE_NAME: ${{ vars.CACHIX_CACHE_NAME }}
+                  CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+              run: cachix push "$CACHIX_CACHE_NAME" ./result
+
+    promote:
+        needs: [resolve, build]
+        runs-on: ubuntu-24.04
+        permissions:
+            contents: write
+        steps:
+            - name: Update install channels after all binaries are cached
+              uses: actions/github-script@v7
+              env:
+                  CHANNELS: ${{ needs.resolve.outputs.channels }}
+              with:
+                  script: |
+                      for (const channel of JSON.parse(process.env.CHANNELS)) {
+                        const ref = `tags/${channel.name}`;
+                        try {
+                          await github.rest.git.getRef({...context.repo, ref});
+                        } catch (error) {
+                          if (error.status !== 404) throw error;
+                          await github.rest.git.createRef({
+                            ...context.repo, ref: `refs/${ref}`, sha: channel.sha
+                          });
+                          continue;
+                        }
+                        await github.rest.git.updateRef({
+                          ...context.repo, ref, sha: channel.sha, force: true
+                        });
+                      }

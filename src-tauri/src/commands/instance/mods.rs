@@ -1,0 +1,689 @@
+use crate::core::errors::InstanceError;
+use crate::core::event_bus;
+use crate::core::validate_filename;
+use crate::services::{
+    AddonManager, AddonMetaNoIcon, InstanceManager, ModSource, PackCacheEntry, PackFullCacheEntry,
+    compute_file_sha1, file_fingerprint, icon_protocol, read_all_full_pack_cache,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use tracing::{error, info, warn};
+
+use super::launch::validate_uuid;
+
+#[derive(serde::Serialize)]
+pub struct ModDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_revision: Option<String>,
+    pub name: String,
+    pub filename: String,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub authors: Option<Vec<String>>,
+    pub icon: Option<String>,
+    pub enabled: bool,
+    pub sha1: String,
+    pub file_size: u64,
+    pub source: String,
+    pub project_id: Option<String>,
+    pub version_id: Option<String>,
+    pub slug: Option<String>,
+    pub pack_name: Option<String>,
+    pub pack_locked: bool,
+    pub pack_modified: bool,
+}
+
+async fn annotate_pack_inventory(
+    instance_dir: &Path,
+    subdir: &str,
+    mut mods: Vec<ModDto>,
+) -> Result<Vec<ModDto>, String> {
+    crate::services::modpack::annotate_mods(instance_dir, subdir, &mut mods)
+        .await
+        .inspect_err(|e| {
+            error!(
+                "Failed to annotate pack inventory in {:?}/{}: {}",
+                instance_dir, subdir, e
+            );
+        })?;
+    Ok(mods)
+}
+
+/// Per-file entry in ablage, keyed by filename
+/// NOTA: Sin icon — se busca aparte via AddonManager::get_mod_icon()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerFileCacheEntry {
+    pub sha1: String,
+    pub metadata: Option<AddonMetaNoIcon>,
+    pub source: ModSource,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ModrinthVersionEntry {
+    pub id: String,
+    pub project_id: String,
+}
+
+const MODRINTH_API: &str = "https://api.modrinth.com/v2";
+
+pub(crate) fn repo_path(mods_dir: &Path) -> PathBuf {
+    mods_dir.join(".mod_cache.crep")
+}
+
+fn is_hidden_or_crep(filename: &str) -> bool {
+    filename.starts_with('.') || filename.ends_with(".crep")
+}
+
+/// Preserve a non-Local source that was saved during a market install
+/// so the frontend can still match the file with a remote project.
+fn preserve_pack_source(entry: &mut PackFullCacheEntry, repo: &ablage::Repo, filename: &str) {
+    if !matches!(entry.source, ModSource::Local) {
+        return;
+    }
+    let Some(data) = repo.get(filename).map(|e| e.data.clone()) else {
+        return;
+    };
+    if let Ok(prev) = postcard::from_bytes::<PackFullCacheEntry>(&data) {
+        entry.source = prev.source;
+    } else if let Ok(prev) = postcard::from_bytes::<PackCacheEntry>(&data) {
+        entry.source = prev.source;
+    }
+}
+
+#[tauri::command]
+pub async fn get_instance_mods(
+    id: String,
+    include_icons: Option<bool>,
+) -> Result<Vec<ModDto>, String> {
+    if let Err(e) = validate_uuid(&id) {
+        warn!("{}", e);
+        return Err(e);
+    }
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&id).await else {
+        warn!("Instance {} not found for listing mods", id);
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    let instance_dir = handle.get_instance_dir().await;
+    let mods_dir = instance_dir.join("mods");
+    let mods = super::mod_catalog::list(id, mods_dir, include_icons.unwrap_or(true), handle).await;
+    annotate_pack_inventory(&instance_dir, "mods", mods).await
+}
+
+pub(super) async fn resolve_modrinth_hashes(
+    hashes: &[String],
+) -> Result<HashMap<String, ModrinthVersionEntry>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent(concat!("moonlauncher/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let body = serde_json::json!({
+        "hashes": hashes,
+        "algorithm": "sha1",
+    });
+
+    let resp = client
+        .post(format!("{}/version_files", MODRINTH_API))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Modrinth API request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Modrinth API returned {}", resp.status()));
+    }
+
+    let result: HashMap<String, ModrinthVersionEntry> = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Modrinth response: {}", e))?;
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn toggle_instance_mod(id: String, filename: String, enable: bool) -> Result<(), String> {
+    validate_uuid(&id)?;
+    info!(
+        "Toggling mod '{}' in instance {}: enable={}",
+        filename, id, enable
+    );
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&id).await else {
+        error!("Instance {} not found for mod toggle", id);
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    let _files_guard = handle.try_lock_files()?;
+    if handle.is_busy() {
+        error!("Attempt to toggle a mod on busy instance {}", id);
+        return Err(InstanceError::Busy.to_string());
+    }
+
+    validate_filename(&filename)?;
+
+    let instance_dir = handle.get_instance_dir().await;
+    let mods_dir = instance_dir.join("mods");
+    let counterpart = filename
+        .strip_suffix(".disabled")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}.disabled", filename));
+    crate::services::modpack::ensure_paths_mutable(
+        &instance_dir,
+        &[
+            format!("mods/{}", filename),
+            format!("mods/{}", counterpart),
+        ],
+    )
+    .await?;
+    let file_path = mods_dir.join(&filename);
+
+    if !file_path.exists() {
+        error!("Mod '{}' not found in instance {}", filename, id);
+        return Err(InstanceError::ModNotFound.to_string());
+    }
+
+    let is_currently_disabled = filename.ends_with(".disabled");
+
+    if enable && is_currently_disabled {
+        let new_filename = filename
+            .strip_suffix(".disabled")
+            .ok_or_else(|| InstanceError::FilenameParse.to_string())?;
+        let new_path = mods_dir.join(new_filename);
+        tokio::fs::rename(file_path, new_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        info!("Mod '{}' enabled in instance {}", new_filename, id);
+    } else if !enable && !is_currently_disabled {
+        let new_filename = format!("{}.disabled", filename);
+        let new_path = mods_dir.join(new_filename);
+        tokio::fs::rename(file_path, new_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        info!("Mod '{}' disabled in instance {}", filename, id);
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_instance_resourcepacks(id: String) -> Result<Vec<ModDto>, String> {
+    if let Err(e) = validate_uuid(&id) {
+        warn!("{}", e);
+        return Err(e);
+    }
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&id).await else {
+        warn!("Instance {} not found for listing resource packs", id);
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    let instance_dir = handle.get_instance_dir().await;
+    let version = handle.get_version().await;
+    let pack_dir = crate::services::pack_dir::physical_pack_dir(&version, "resourcepacks");
+    if !handle.is_busy()
+        && let Ok(_files_guard) = handle.try_lock_files()
+    {
+        crate::services::pack_dir::migrate_legacy_packs(&instance_dir, &version).await?;
+    }
+    let resourcepacks_dir = instance_dir.join(pack_dir);
+
+    struct FileEntry {
+        path: PathBuf,
+        filename: String,
+        size: u64,
+        fingerprint: u64,
+    }
+
+    let entries = tokio::task::spawn_blocking({
+        let d = resourcepacks_dir.clone();
+        move || -> Vec<FileEntry> {
+            let dir = match std::fs::read_dir(&d) {
+                Ok(d) => d,
+                Err(_) => return Vec::new(),
+            };
+            dir.flatten()
+                .filter_map(|e| {
+                    let path = e.path();
+                    if !path.is_file() {
+                        return None;
+                    }
+                    let filename = path.file_name()?.to_string_lossy().to_string();
+                    if is_hidden_or_crep(&filename) {
+                        return None;
+                    }
+                    let meta = std::fs::metadata(&path).ok()?;
+                    let mtime = meta.modified().ok()?;
+                    let size = meta.len();
+                    let fingerprint = file_fingerprint(&filename, &mtime, size);
+                    Some(FileEntry {
+                        path,
+                        filename,
+                        size,
+                        fingerprint,
+                    })
+                })
+                .collect()
+        }
+    })
+    .await
+    .unwrap_or_default();
+
+    if entries.is_empty() {
+        return annotate_pack_inventory(&instance_dir, pack_dir, Vec::new()).await;
+    }
+
+    let dir_clone = entries[0].path.parent().unwrap().to_path_buf();
+    let cache_path = crate::services::pack_cache_path_custom(&dir_clone);
+
+    let global_fp: u64 = crate::services::pack_cache_fingerprint(
+        entries.iter().fold(0, |acc, e| acc ^ e.fingerprint),
+    );
+
+    if ablage::Repo::check_global_fingerprint(&cache_path, global_fp) {
+        let cache = read_all_full_pack_cache(&dir_clone);
+        let icon_kind = "resourcepacks";
+        let mut resourcepacks: Vec<ModDto> = entries
+            .into_iter()
+            .map(|e| {
+                let revision = e.fingerprint.to_string();
+                let cached = cache.get(&e.filename);
+                match cached {
+                    Some(entry) => {
+                        let (md_name, md_desc) = entry
+                            .metadata
+                            .as_ref()
+                            .map(|m| (m.name.clone(), m.description.clone()))
+                            .unwrap_or_else(|| (e.filename.clone(), None));
+                        let icon = entry.icon.as_ref().map(|_| {
+                            icon_protocol::url(&id, icon_kind, &e.filename, Some(&revision))
+                        });
+                        ModDto {
+                            pack_name: None,
+                            pack_locked: false,
+                            pack_modified: false,
+                            icon_revision: Some(revision),
+                            name: md_name,
+                            filename: e.filename,
+                            version: entry.metadata.as_ref().and_then(|m| m.version.clone()),
+                            description: md_desc,
+                            authors: entry.metadata.as_ref().and_then(|m| m.authors.clone()),
+                            icon,
+                            enabled: true,
+                            sha1: entry.sha1.clone(),
+                            file_size: e.size,
+                            source: entry.source.source_str().to_string(),
+                            project_id: entry.source.project_id().map(|s| s.to_string()),
+                            version_id: entry.source.version_id().map(str::to_owned),
+                            slug: entry.source.slug().map(|s| s.to_string()),
+                        }
+                    }
+                    None => ModDto {
+                        pack_name: None,
+                        pack_locked: false,
+                        pack_modified: false,
+                        icon_revision: Some(revision),
+                        name: e.filename.clone(),
+                        filename: e.filename,
+                        version: None,
+                        description: None,
+                        authors: None,
+                        icon: None,
+                        enabled: true,
+                        sha1: String::new(),
+                        file_size: e.size,
+                        source: "local".to_string(),
+                        project_id: None,
+                        version_id: None,
+                        slug: None,
+                    },
+                }
+            })
+            .collect();
+        resourcepacks.sort_by_key(|a| a.name.to_lowercase());
+        info!(
+            "{} resource packs loaded from cache in instance {}",
+            resourcepacks.len(),
+            id
+        );
+        return annotate_pack_inventory(&instance_dir, pack_dir, resourcepacks).await;
+    }
+
+    // Cache miss: return minimal, enrich in background
+    let minimal: Vec<ModDto> = entries
+        .iter()
+        .map(|e| ModDto {
+            pack_name: None,
+            pack_locked: false,
+            pack_modified: false,
+            icon_revision: None,
+            name: e.filename.clone(),
+            filename: e.filename.clone(),
+            version: None,
+            description: None,
+            authors: None,
+            icon: None,
+            enabled: true,
+            sha1: String::new(),
+            file_size: e.size,
+            source: "local".to_string(),
+            project_id: None,
+            version_id: None,
+            slug: None,
+        })
+        .collect();
+
+    info!(
+        "{} resource packs listed (minimal) in instance {} — enriching in background",
+        minimal.len(),
+        id
+    );
+
+    let id2 = id.clone();
+    let cache_path2 = cache_path.clone();
+    let pack_dir_task = pack_dir.to_string();
+    tokio::spawn(async move {
+        let handles: Vec<_> = entries
+            .into_iter()
+            .map(|e| {
+                let path = e.path.clone();
+                let filename = e.filename.clone();
+                let fingerprint = e.fingerprint;
+                tokio::task::spawn_blocking(move || -> (String, u64, PackFullCacheEntry) {
+                    let sha1 = compute_file_sha1(&path).unwrap_or_default();
+                    let (meta, icon) = AddonManager::get_resourcepack_info_full(&path);
+                    let icon_str = icon.map(|s| (*s).clone());
+                    let entry = PackFullCacheEntry {
+                        sha1: sha1.clone(),
+                        metadata: meta,
+                        icon: icon_str,
+                        source: ModSource::Local,
+                    };
+                    (filename, fingerprint, entry)
+                })
+            })
+            .collect();
+
+        let mut results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let Ok(_files_guard) = handle.try_lock_files() else {
+            return;
+        };
+        if handle.get_instance_dir().await.join(&pack_dir_task) != resourcepacks_dir {
+            return;
+        }
+        let mut repo = ablage::Repo::open(&cache_path2);
+        for (filename, fingerprint, entry) in &mut results {
+            preserve_pack_source(entry, &repo, filename);
+            if let Ok(data) = postcard::to_stdvec(entry) {
+                repo.put(
+                    filename.clone(),
+                    ablage::Entry {
+                        version: 1,
+                        fingerprint: *fingerprint,
+                        data,
+                    },
+                );
+            }
+        }
+        repo.put(
+            "__global",
+            ablage::Entry {
+                version: 1,
+                fingerprint: global_fp,
+                data: global_fp.to_le_bytes().to_vec(),
+            },
+        );
+        let _ = repo.flush();
+
+        event_bus::emit(event_bus::AppEvent::ResourcepacksEnriched { id: id2.into() });
+    });
+
+    annotate_pack_inventory(&instance_dir, pack_dir, minimal).await
+}
+
+#[tauri::command]
+pub async fn get_instance_shaderpacks(id: String) -> Result<Vec<ModDto>, String> {
+    if let Err(e) = validate_uuid(&id) {
+        warn!("{}", e);
+        return Err(e);
+    }
+    let manager = InstanceManager::get();
+    let Some(handle) = manager.get_handle(&id).await else {
+        warn!("Instance {} not found for listing shader packs", id);
+        return Err(InstanceError::NotFound.to_string());
+    };
+
+    let instance_dir = handle.get_instance_dir().await;
+    let shaderpacks_dir = instance_dir.join("shaderpacks");
+
+    struct FileEntry {
+        path: PathBuf,
+        filename: String,
+        size: u64,
+        fingerprint: u64,
+    }
+
+    let entries = tokio::task::spawn_blocking({
+        let d = shaderpacks_dir.clone();
+        move || -> Vec<FileEntry> {
+            let dir = match std::fs::read_dir(&d) {
+                Ok(d) => d,
+                Err(_) => return Vec::new(),
+            };
+            dir.flatten()
+                .filter_map(|e| {
+                    let path = e.path();
+                    if !path.is_file() {
+                        return None;
+                    }
+                    let filename = path.file_name()?.to_string_lossy().to_string();
+                    if is_hidden_or_crep(&filename) {
+                        return None;
+                    }
+                    let file_name_lower = filename.to_lowercase();
+                    if !(file_name_lower.ends_with(".zip")
+                        || file_name_lower.ends_with(".zip.disabled"))
+                    {
+                        return None;
+                    }
+                    let meta = std::fs::metadata(&path).ok()?;
+                    let mtime = meta.modified().ok()?;
+                    let size = meta.len();
+                    let fingerprint = file_fingerprint(&filename, &mtime, size);
+                    Some(FileEntry {
+                        path,
+                        filename,
+                        size,
+                        fingerprint,
+                    })
+                })
+                .collect()
+        }
+    })
+    .await
+    .unwrap_or_default();
+
+    if entries.is_empty() {
+        return annotate_pack_inventory(&instance_dir, "shaderpacks", Vec::new()).await;
+    }
+
+    let dir_clone = entries[0].path.parent().unwrap().to_path_buf();
+    let cache_path = crate::services::pack_cache_path_custom(&dir_clone);
+
+    let global_fp: u64 = crate::services::pack_cache_fingerprint(
+        entries.iter().fold(0, |acc, e| acc ^ e.fingerprint),
+    );
+
+    if ablage::Repo::check_global_fingerprint(&cache_path, global_fp) {
+        let cache = read_all_full_pack_cache(&dir_clone);
+        let icon_kind = "shaderpacks";
+        let mut shaderpacks: Vec<ModDto> = entries
+            .into_iter()
+            .map(|e| {
+                let revision = e.fingerprint.to_string();
+                let cached = cache.get(&e.filename);
+                match cached {
+                    Some(entry) => {
+                        let (md_name, md_desc) = entry
+                            .metadata
+                            .as_ref()
+                            .map(|m| (m.name.clone(), m.description.clone()))
+                            .unwrap_or_else(|| (e.filename.clone(), None));
+                        let icon = entry.icon.as_ref().map(|_| {
+                            icon_protocol::url(&id, icon_kind, &e.filename, Some(&revision))
+                        });
+                        ModDto {
+                            pack_name: None,
+                            pack_locked: false,
+                            pack_modified: false,
+                            icon_revision: Some(revision),
+                            name: md_name,
+                            filename: e.filename,
+                            version: entry.metadata.as_ref().and_then(|m| m.version.clone()),
+                            description: md_desc,
+                            authors: entry.metadata.as_ref().and_then(|m| m.authors.clone()),
+                            icon,
+                            enabled: true,
+                            sha1: entry.sha1.clone(),
+                            file_size: e.size,
+                            source: entry.source.source_str().to_string(),
+                            project_id: entry.source.project_id().map(|s| s.to_string()),
+                            version_id: entry.source.version_id().map(str::to_owned),
+                            slug: entry.source.slug().map(|s| s.to_string()),
+                        }
+                    }
+                    None => ModDto {
+                        pack_name: None,
+                        pack_locked: false,
+                        pack_modified: false,
+                        icon_revision: Some(revision),
+                        name: e.filename.clone(),
+                        filename: e.filename,
+                        version: None,
+                        description: None,
+                        authors: None,
+                        icon: None,
+                        enabled: true,
+                        sha1: String::new(),
+                        file_size: e.size,
+                        source: "local".to_string(),
+                        project_id: None,
+                        version_id: None,
+                        slug: None,
+                    },
+                }
+            })
+            .collect();
+        shaderpacks.sort_by_key(|a| a.name.to_lowercase());
+        info!(
+            "{} shader packs loaded from cache in instance {}",
+            shaderpacks.len(),
+            id
+        );
+        return annotate_pack_inventory(&instance_dir, "shaderpacks", shaderpacks).await;
+    }
+
+    // Cache miss: return minimal, enrich in background
+    let minimal: Vec<ModDto> = entries
+        .iter()
+        .map(|e| ModDto {
+            pack_name: None,
+            pack_locked: false,
+            pack_modified: false,
+            icon_revision: None,
+            name: e.filename.clone(),
+            filename: e.filename.clone(),
+            version: None,
+            description: None,
+            authors: None,
+            icon: None,
+            enabled: true,
+            sha1: String::new(),
+            file_size: e.size,
+            source: "local".to_string(),
+            project_id: None,
+            version_id: None,
+            slug: None,
+        })
+        .collect();
+
+    info!(
+        "{} shader packs listed (minimal) in instance {} — enriching in background",
+        minimal.len(),
+        id
+    );
+
+    let id2 = id.clone();
+    let cache_path2 = cache_path.clone();
+    tokio::spawn(async move {
+        let handles: Vec<_> = entries
+            .into_iter()
+            .map(|e| {
+                let path = e.path.clone();
+                let filename = e.filename.clone();
+                let fingerprint = e.fingerprint;
+                tokio::task::spawn_blocking(move || -> (String, u64, PackFullCacheEntry) {
+                    let sha1 = compute_file_sha1(&path).unwrap_or_default();
+                    let (meta, icon) = AddonManager::get_shaderpack_info_full(&path);
+                    let icon_str = icon.map(|s| (*s).clone());
+                    let entry = PackFullCacheEntry {
+                        sha1: sha1.clone(),
+                        metadata: meta,
+                        icon: icon_str,
+                        source: ModSource::Local,
+                    };
+                    (filename, fingerprint, entry)
+                })
+            })
+            .collect();
+
+        let mut results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let Ok(_files_guard) = handle.try_lock_files() else {
+            return;
+        };
+        if handle.get_instance_dir().await.join("shaderpacks") != shaderpacks_dir {
+            return;
+        }
+        let mut repo = ablage::Repo::open(&cache_path2);
+        for (filename, fingerprint, entry) in &mut results {
+            preserve_pack_source(entry, &repo, filename);
+            if let Ok(data) = postcard::to_stdvec(entry) {
+                repo.put(
+                    filename.clone(),
+                    ablage::Entry {
+                        version: 1,
+                        fingerprint: *fingerprint,
+                        data,
+                    },
+                );
+            }
+        }
+        repo.put(
+            "__global",
+            ablage::Entry {
+                version: 1,
+                fingerprint: global_fp,
+                data: global_fp.to_le_bytes().to_vec(),
+            },
+        );
+        let _ = repo.flush();
+
+        event_bus::emit(event_bus::AppEvent::ShaderpacksEnriched { id: id2.into() });
+    });
+
+    annotate_pack_inventory(&instance_dir, "shaderpacks", minimal).await
+}

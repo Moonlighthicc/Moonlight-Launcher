@@ -1,0 +1,80 @@
+{
+	"$schema": "https://schema.tauri.app/config/2",
+	"productName": "Moonlight Launcher",
+	"mainBinaryName": "Moonlight Launcher",
+	"version": "0.19.0",
+	"identifier": "com.moonlightlauncher.app",
+	"build": {
+		"beforeDevCommand": "bun run dev",
+		"devUrl": "http://localhost:1420",
+		"beforeBuildCommand": "bun run build",
+		"frontendDist": "../build"
+	},
+	"app": {
+		"windows": [
+			{
+				"label": "main",
+				"title": "Moonlight Launcher",
+				"width": 800,
+				"height": 600,
+				"minWidth": 800,
+				"minHeight": 600,
+				"create": false,
+				"devtools": false,
+				"browserExtensionsEnabled": false,
+				"generalAutofillEnabled": false,
+				"zoomHotkeysEnabled": false,
+				"backgroundThrottling": "throttle",
+				"additionalBrowserArgs": "--disable-features=PDFViewer,PdfOopif,msSmartScreenProtection,HardwareMediaKeyHandling,EdgeSidebar,EdgeShopping,EdgeWallet,EdgeRewards,EdgeDrop,EdgeCollections,EdgeTour,EdgeFollow,EdgeDiscover,OptimizationGuideModelDownloading,OptimizationGuideOnDeviceModel"
+			}
+		],
+		"security": {
+			"dangerousDisableAssetCspModification": ["style-src"],
+			"csp": {
+				"default-src": "'self' tauri: https://tauri.localhost",
+				"base-uri": "'self'",
+				"object-src": "'none'",
+				"img-src": "'self' asset: http://asset.localhost cubic-icon: http://cubic-icon.localhost cubic-market-icon: http://cubic-market-icon.localhost https: http://textures.minecraft.net blob: data:",
+				"style-src": "'self' 'unsafe-inline' blob: https://tauri.localhost",
+				"font-src": "'self' asset: https: http://asset.localhost",
+				"script-src": "'self'",
+				"script-src-attr": "'none'",
+				"connect-src": "'self' tauri://localhost ipc://localhost http://ipc.localhost https://tauri.localhost https://i18n.cubiclauncher.org https://skins.cubiclauncher.org https://mosaicary.com"
+			},
+			"devCsp": {
+				"default-src": "'self' tauri: http://localhost:* https://tauri.localhost",
+				"base-uri": "'self'",
+				"object-src": "'none'",
+				"img-src": "'self' asset: http://asset.localhost cubic-icon: http://cubic-icon.localhost cubic-market-icon: http://cubic-market-icon.localhost https: http://textures.minecraft.net blob: data: http://localhost:*",
+				"style-src": "'self' 'unsafe-inline' blob: http://localhost:* https://tauri.localhost",
+				"font-src": "'self' asset: https: https://asset.localhost http://asset.localhost http://localhost:*",
+				"script-src": "'self' 'unsafe-inline' http://localhost:*",
+				"script-src-attr": "'none'",
+				"connect-src": "'self' tauri://localhost ipc://localhost http://ipc.localhost http://localhost:* ws://localhost:* https://tauri.localhost https://i18n.cubiclauncher.org https://skins.cubiclauncher.org https://mosaicary.com"
+			},
+			"assetProtocol": {
+				"enable": true,
+				"scope": ["$HOME/.moonlauncher/**"]
+			}
+		}
+	},
+	"bundle": {
+	"active": true,
+	"targets": ["nsis"],
+	"createUpdaterArtifacts": false,
+	"icon": [
+		"icons/32x32.png",
+		"icons/128x128.png",
+		"icons/128x128@2x.png",
+		"icons/icon.icns",
+		"icons/icon.ico"
+	]
+	},
+	"plugins": {
+		"updater": {
+			"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM2QkJCQ0JGMjc1NkRGOUQKUldTZDMxWW52N3k3eGt1NW1tYmRNVnNjSEtBdUp1Slh1SWV6ZFBibUtRR3BLR3c5Z0luQmJpZ0wK",
+			"endpoints": [],
+			"windows": { "installMode": "passive" }
+		}
+	}
+}

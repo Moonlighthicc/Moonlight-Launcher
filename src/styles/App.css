@@ -1,0 +1,20 @@
+/* ==========================================================================
+   App.css — Global & shared styles only
+   Component-specific CSS lives in each .svelte file's <style> block.
+   ========================================================================== */
+
+@import "./shared/reset.css" layer(cubic);
+@import "./shared/layout.css" layer(cubic);
+@import "./shared/components.css" layer(cubic);
+@import "./shared/skeleton.css" layer(cubic);
+@import "./shared/market.css" layer(cubic);
+@import "./shared/interface.css" layer(cubic);
+@import "./shared/modal.css" layer(cubic);
+@import "./shared/welcome.css" layer(cubic);
+@import "./shared/perf.css" layer(cubic);
+@import "./shared/launcher.css";
+
+/* A programmatic focus transfer can inherit :focus-visible from a text input. */
+html[data-pointer-focus] :focus-visible {
+	outline: none !important;
+}

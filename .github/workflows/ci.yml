@@ -1,0 +1,204 @@
+name: CI
+
+on:
+    push:
+        branches: [main, develop]
+    pull_request:
+        branches: [main, develop]
+    workflow_dispatch:
+
+# A newer pull request update supersedes the previous run for the same PR.
+# Pushes to develop are not cancelled: the Nix and macOS jobs can take long
+# enough that a cancel would keep restarting them without ever finishing.
+concurrency:
+    group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege: every job only reads the repository.
+permissions:
+    contents: read
+
+env:
+    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+
+jobs:
+    nix:
+        name: Nix Hashes (${{ matrix.system }})
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                # Keep in sync with supportedSystems in flake.nix.
+                include:
+                    - system: x86_64-linux
+                      runner: ubuntu-24.04
+                    - system: aarch64-linux
+                      runner: ubuntu-24.04-arm
+                    - system: aarch64-darwin
+                      runner: macos-15
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Install Nix
+              uses: cachix/install-nix-action@v31
+              with:
+                  extra_nix_config: |
+                      experimental-features = nix-command flakes
+
+            - name: Verify dependency hashes
+              # Realize only the dependency outputs; this does not compile the launcher.
+              run: |
+                  nix build --no-link --keep-going --print-build-logs \
+                    ".#packages.${{ matrix.system }}.default.nodeModules" \
+                    ".#packages.${{ matrix.system }}.default.cargoDeps"
+
+            - name: Verify Bun dependency reproducibility
+              # Repeat the installation and compare it with the first output.
+              run: |
+                  nix build --rebuild --no-link --print-build-logs \
+                    ".#packages.${{ matrix.system }}.default.nodeModules"
+
+    frontend:
+        name: Frontend Checks
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        env:
+            NODE_OPTIONS: --max-old-space-size=6144
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Setup Bun
+              uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: latest
+
+            - name: Cache Bun packages
+              uses: actions/cache@v6
+              with:
+                  path: ~/.bun/install/cache
+                  key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-bun-
+
+            - name: Install dependencies
+              run: bun install --frozen-lockfile
+
+            - name: Lint
+              run: bun run lint
+
+            - name: Format check
+              run: bun run format:check
+
+            - name: Type check
+              run: bun run check
+
+            - name: Frontend tests
+              run: bun run test:frontend
+
+            - name: Production build
+              run: bun run build
+
+    rustfmt:
+        name: Rust Format Check
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Install Rust stable
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: rustfmt
+
+            # Formatting is platform-independent, so it runs once instead of
+            # inside every job of the Rust matrix.
+            - name: Format check
+              run: cargo fmt --all --check
+
+    rust:
+        name: Rust Checks (${{ matrix.os }})
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 45
+        strategy:
+            fail-fast: false
+            matrix:
+                # Windows and macOS runners already ship the WebView2 runtime and
+                # WKWebView; only Linux needs extra system packages.
+                os: [ubuntu-latest, windows-latest, macos-latest]
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Install Linux dependencies
+              if: runner.os == 'Linux'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends \
+                    libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+                    librsvg2-dev patchelf
+
+            - name: Install Rust stable
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy
+
+            - name: Rust cache
+              uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: ". -> target"
+                  # One cache per OS; dev/test artifacts differ from release builds.
+                  shared-key: ci-rust-${{ runner.os }}
+                  # Pull request runs never save, so they cannot evict the cache
+                  # seeded by the default branch.
+                  save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+            - name: Clippy
+              run: cargo clippy --workspace --locked -- -D warnings
+
+            - name: Tests
+              if: runner.os != 'Windows'
+              run: cargo test --workspace --locked
+
+            - name: Tests (Windows)
+              if: runner.os == 'Windows'
+              # tauri#13419: the lib unit-test binary of the Tauri app crate is
+              # linked without an RT_MANIFEST, so comctl32 v5 is loaded and
+              # TaskDialogIndirect is missing (0xc0000139). The remaining crates
+              # still run, and the app crate is covered on Linux and macOS.
+              # Drop --exclude once tauri-build links the manifest into tests.
+              run: cargo test --workspace --locked --exclude moonlauncher
+
+    ci-status:
+        name: CI Status
+        # Single required check: fails whenever any validation job did not succeed.
+        if: always()
+        needs: [nix, frontend, rustfmt, rust]
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - name: Check results
+              env:
+                  NIX_RESULT: ${{ needs.nix.result }}
+                  FRONTEND_RESULT: ${{ needs.frontend.result }}
+                  RUSTFMT_RESULT: ${{ needs.rustfmt.result }}
+                  RUST_RESULT: ${{ needs.rust.result }}
+              run: |
+                  failed=0
+                  for entry in \
+                    "nix:$NIX_RESULT" \
+                    "frontend:$FRONTEND_RESULT" \
+                    "rustfmt:$RUSTFMT_RESULT" \
+                    "rust:$RUST_RESULT"; do
+                    name="${entry%%:*}"
+                    result="${entry#*:}"
+                    if [ "$result" != "success" ]; then
+                      echo "::error title=$name::$name finished with result '$result'"
+                      failed=1
+                    fi
+                  done
+                  if [ "$failed" -ne 0 ]; then
+                    exit 1
+                  fi
+                  echo "All CI checks passed."

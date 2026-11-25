@@ -1,0 +1,77 @@
+<script lang="ts">
+	import type { SvelteHTMLElements } from "svelte/elements";
+	import { getThemeIcon } from "$lib/api/themeManager";
+	import { getIconPath, isRasterIcon } from "$lib/icons/registry";
+
+	type SpanProps = SvelteHTMLElements["span"];
+
+	function coerceSize(
+		value: string | number | undefined,
+	): string | undefined {
+		if (value === undefined) return undefined;
+		if (typeof value === "number") return `${value}px`;
+		if (/^\d+(\.\d+)?$/.test(value)) return `${value}px`;
+		return value;
+	}
+
+	let {
+		class: className = "",
+		src,
+		name,
+		fallbackName,
+		size = 16,
+		width,
+		height,
+		color,
+		style: customStyle,
+		...rest
+	}: {
+		class?: string;
+		src?: string;
+		name?: string;
+		fallbackName?: string;
+		size?: number;
+		width?: string | number;
+		height?: string | number;
+		color?: string | null;
+	} & SpanProps = $props();
+
+	const w = $derived(coerceSize(width ?? size));
+	const h = $derived(coerceSize(height ?? size));
+
+	const customIcon = $derived.by(() => {
+		if (!name) return null;
+		return (
+			getThemeIcon(name) ??
+			(fallbackName ? getThemeIcon(fallbackName) : null)
+		);
+	});
+
+	const resolvedSrc = $derived.by(() => {
+		if (customIcon) return customIcon;
+		if (src) return src;
+		if (name) return getIconPath(name) ?? "";
+		return "";
+	});
+	const raster = $derived(isRasterIcon(resolvedSrc));
+
+	const style = $derived.by(() => {
+		let base = `width: calc(${w} * var(--icon-scale, 1)); height: calc(${h} * var(--icon-scale, 1));`;
+		if (color) base += ` color: ${color};`;
+		if (raster) {
+			base += ` background-image: url("${resolvedSrc}");`;
+		} else {
+			base += ` mask-image: url("${resolvedSrc}"); -webkit-mask-image: url("${resolvedSrc}");`;
+		}
+		return `${base} ${customStyle ?? ""}`;
+	});
+</script>
+
+<span
+	class="icon-svg {className}"
+	class:icon-raster={raster}
+	class:icon-mask={!raster}
+	{style}
+	aria-hidden="true"
+	{...rest}
+></span>
