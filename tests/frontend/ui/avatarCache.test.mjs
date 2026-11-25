@@ -7,7 +7,7 @@ async function fixture(saved = null) {
 	const root = resolve(import.meta.dir, "../../..");
 	const source = join(root, "src/lib/state/avatarCache.svelte.ts");
 	const stub = `
-export const hooks = {now:0, saved:${JSON.stringify(saved)}, native:async()=>'<svg/>', fallback:async()=>new Response('<svg/>')};
+export const hooks = {now:0, saved:${JSON.stringify(saved)}, native:async()=>'<svg/>'};
 export const localStorage = {
 	getItem: () => hooks.saved,
 	setItem: (_, value) => {hooks.saved = value;},
@@ -15,7 +15,7 @@ export const localStorage = {
 export const calls = {native:0, fallback:0};
 export const Date = {now:()=>hooks.now};
 export const getAvatarSvg = (...args) => {calls.native++; return hooks.native(...args)};
-export const fetch = (...args) => {calls.fallback++; return hooks.fallback(...args)};
+export const fetch = () => {calls.fallback++; throw new Error('Unexpected WebView avatar fetch')};
 `;
 	const result = await Bun.build({
 		entrypoints: ["avatar-entry"],
@@ -145,41 +145,12 @@ test("skin invalidation rejects old native results without deleting a replacemen
 	}
 });
 
-test("fallback fetches are shared and aborted when the skin changes", async () => {
-	const f = await fixture();
-	try {
-		let rejectNative;
-		let signal;
-		let releaseFallback;
-		f.hooks.native = () =>
-			new Promise((_, reject) => (rejectNative = reject));
-		f.hooks.fallback = (_, options) => {
-			signal = options.signal;
-			return new Promise((resolve) => (releaseFallback = resolve));
-		};
-		const first = f.fetchAvatarSvg("user", "Yggdrasil");
-		const second = f.fetchAvatarSvg("user", "Yggdrasil");
-		rejectNative(new Error("native avatar unavailable (expected in test)"));
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(f.calls.fallback).toBe(1);
-		f.bumpAvatarVersion("user");
-		expect(signal.aborted).toBe(true);
-		releaseFallback(new Response("<svg>stale fallback</svg>"));
-		expect(await first).toBe("");
-		expect(await second).toBe("");
-		expect(f.getAvatar("user@0")).toBeUndefined();
-	} finally {
-		await f.cleanup();
-	}
-});
-
 test("failed requests can retry and offline users need no native or network requests", async () => {
 	const f = await fixture();
 	try {
 		f.hooks.native = async () => {
 			throw new Error("expected native failure");
 		};
-		f.hooks.fallback = async () => new Response(null, { status: 503 });
 		expect(await f.fetchAvatarSvg("user", "Microsoft")).toBe("");
 		const recoveredSvg = '<svg width="64" height="64">recovered</svg>';
 		f.hooks.native = async () => recoveredSvg;
@@ -221,18 +192,18 @@ test("forced refresh updates the shared image, deduplicates and wins over a stal
 	}
 });
 
-test("a failed forced refresh bypasses the HTTP cache without clearing the visible avatar", async () => {
+test("a failed Yggdrasil refresh keeps the previous avatar without a WebView request", async () => {
 	const f = await fixture();
 	try {
 		const account = { uuid: "user", username: "Steve", user_type: "Yggdrasil" };
 		f.setAvatar("user@0", "previous");
-		f.hooks.native = async () => { throw new Error("expected native failure"); };
-		f.hooks.fallback = async (_, options) => {
-			expect(options.cache).toBe("no-store");
-			return new Response(null, { status: 503 });
+		f.hooks.native = async (uuid, force) => {
+			expect(uuid).toBe("user");
+			expect(force).toBe(true);
+			throw new Error("expected native failure");
 		};
 		expect(await f.refreshAvatarSvg(account)).toBe(false);
-		expect(f.calls).toEqual({ native: 1, fallback: 1 });
+		expect(f.calls).toEqual({ native: 1, fallback: 0 });
 		expect(f.accountAvatar(account)).toBe("previous");
 	} finally {
 		await f.cleanup();
@@ -260,13 +231,13 @@ test("a slow Microsoft avatar is not replaced by a third-party image", async () 
 	}
 }, 8000);
 
-test("an unusable native avatar still triggers the Yggdrasil fallback", async () => {
+test("an unusable Yggdrasil avatar falls back to the default UI without a WebView request", async () => {
 	const f = await fixture();
 	try {
-		const skin = '<svg viewBox="0 0 8 8"><rect width="8" height="8"/></svg>';
-		f.hooks.fallback = async () => new Response(skin);
-		expect(await f.fetchAvatarSvg("user", "Yggdrasil")).toBe(f.normalizeAvatarSvg(skin));
-		expect(f.calls).toEqual({ native: 1, fallback: 1 });
+		const account = { uuid: "user", user_type: "Yggdrasil", yggdrasil_server_url: "https://provider.example" };
+		expect(await f.refreshAvatarSvg(account)).toBe(false);
+		expect(f.accountAvatar(account)).toBe(f.DEFAULT_AVATAR_SVG);
+		expect(f.calls).toEqual({ native: 1, fallback: 0 });
 	} finally {
 		await f.cleanup();
 	}

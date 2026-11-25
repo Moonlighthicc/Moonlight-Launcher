@@ -12,8 +12,8 @@ Gracias por interesarte en mejorar moonlauncher. Este documento resume cómo col
 ## Instalación local
 
 ```bash
-git clone https://github.com/CubicLauncherDevs/CubicLauncher.git
-cd moonlauncher
+git clone https://github.com/Moonlighthicc/Moonlight-Launcher.git
+cd Moonlight-Launcher
 bun install
 ```
 
@@ -139,32 +139,16 @@ BREAKING CHANGE: los errores ahora usan el campo `code` en snake_case.
 
 ### Internacionalización
 
-Las traducciones se manejan en el repositorio
-[moonlauncherDevs/Translations](https://github.com/CubicLauncherDevs/Translations),
-que publica los idiomas en `https://i18n.cubiclauncher.org`. El launcher solo
-bundlea localmente `es-ES` y `en-US` como fallback:
+Los idiomas se incluyen en la aplicación y no requieren un servicio de traducción:
 
-- `src/lib/i18n/es-ES.json`
 - `src/lib/i18n/en-US.json`
+- `src/lib/i18n/ru-RU.json`
 
-#### Agregar una clave nueva (es-ES / en-US)
+#### Agregar una clave nueva (en-US / ru-RU)
 
 Si agregás un texto nuevo en la UI, agregá la clave en ambos archivos
-bundleados (`en-US.json` es la referencia de la que se deriva el tipado en
-`src/lib/i18n/index.ts`).
-
-#### Editar o agregar traducciones de otros idiomas
-
-En el repo [Translations](https://github.com/CubicLauncherDevs/Translations):
-
-1. Editá los archivos `src/locales/*.json` (por ejemplo `fr-FR.json`).
-2. Incrementá el campo `version` de cada idioma modificado.
-3. Añadí la entrada correspondiente a `src/changelog.json` (tipo
-   `locale.updated` o `locale.added`).
-4. Build y deploy del Worker: `bun run build && bun run deploy`.
-
-> Para rellenar claves faltantes respecto a `en-US`, podés usar
-> `bun run sync-locales` en el repo de Translations.
+incluidos. `en-US.json` define las claves de `src/lib/i18n/index.ts` y se usa
+cuando falta una traducción.
 
 ## Labels de Pull Request
 

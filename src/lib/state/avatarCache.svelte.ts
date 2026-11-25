@@ -5,7 +5,7 @@ import offlineAvatarSvg from "$lib/assets/offline-avatar.svg?raw";
 import type { MinecraftUser } from "$lib/types/types";
 
 interface CacheEntry {
-	// Render SVGs as <img> data URLs, never as inline HTML from the fallback service.
+	// Render SVGs as <img> data URLs, never as inline HTML.
 	svg: string;
 	fetchedAt: number;
 }
@@ -24,7 +24,7 @@ interface PendingAvatar {
 	forced: boolean;
 }
 
-// Request handles are not UI state. Share both native and fallback requests.
+// Request handles are not UI state. Share native requests between consumers.
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const pendingFetches = new Map<string, PendingAvatar>();
 
@@ -134,24 +134,9 @@ export function bumpAvatarVersion(uuid: string): number {
 	return next;
 }
 
-export function buildAvatarUrl(
-	uuid: string,
-	username: string,
-	user_type: string,
-	serverUrl?: string | null,
-): string {
-	const endpoint = user_type === "Yggdrasil" ? "elyby" : "mojang";
-	const version = getAvatarVersion(uuid);
-	const serverParam =
-		user_type === "Yggdrasil" && serverUrl
-			? `&server=${encodeURIComponent(serverUrl)}`
-			: "";
-	return `https://skins.cubiclauncher.org/api/${endpoint}/head/${encodeURIComponent(username)}?t=${version}${serverParam}`;
-}
-
 export const DEFAULT_AVATAR_SVG = "";
 
-type AvatarAccount = Pick<MinecraftUser, "uuid" | "user_type" | "username" | "yggdrasil_server_url">;
+type AvatarAccount = Pick<MinecraftUser, "uuid" | "user_type" | "yggdrasil_server_url">;
 const offlineAvatar = normalizeAvatarSvg(offlineAvatarSvg);
 
 /** Read the shared image reactively without dropping a stale image during revalidation. */
@@ -261,21 +246,19 @@ export async function fetchAvatarSvg(
 	uuid: string,
 	userType: string,
 	serverUrl?: string | null,
-	username?: string,
 ): Promise<string> {
-	return requestAvatarSvg(uuid, userType, serverUrl, username, false);
+	return requestAvatarSvg(uuid, userType, serverUrl, false);
 }
 
 export async function refreshAvatarSvg(account: AvatarAccount): Promise<boolean> {
-	const { uuid, user_type, yggdrasil_server_url, username } = account;
-	return Boolean(await requestAvatarSvg(uuid, user_type, yggdrasil_server_url, username, true));
+	const { uuid, user_type, yggdrasil_server_url } = account;
+	return Boolean(await requestAvatarSvg(uuid, user_type, yggdrasil_server_url, true));
 }
 
 async function requestAvatarSvg(
 	uuid: string,
 	userType: string,
 	serverUrl: string | null | undefined,
-	username: string | undefined,
 	force: boolean,
 ): Promise<string> {
 	if (userType === "Cracked") {
@@ -297,13 +280,7 @@ async function requestAvatarSvg(
 	pending?.controller.abort();
 
 	const controller = new AbortController();
-	// Microsoft profile loading can include a session refresh. A third-party
-	// head by username is not authoritative and may return a placeholder SVG.
-	const fallbackUrl =
-		userType === "Microsoft"
-			? undefined
-			: buildAvatarUrl(uuid, username ?? "", userType, serverUrl);
-	const promise = loadAvatar(uuid, fallbackUrl, controller.signal, force || version > 0)
+	const promise = loadAvatar(uuid, controller.signal, force || version > 0)
 		.then((svg) => {
 			// Native requests cannot be aborted; reject results invalidated in flight.
 			if (
@@ -330,40 +307,13 @@ async function requestAvatarSvg(
 
 async function loadAvatar(
 	uuid: string,
-	fallbackUrl: string | undefined,
 	signal: AbortSignal,
 	fresh: boolean,
 ): Promise<string> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const native = getAvatarSvg(uuid, fresh);
-		const svg = fallbackUrl
-			? await Promise.race([
-					native,
-					new Promise<string>((_, reject) => {
-						timer = setTimeout(() => reject(new Error("Avatar request timed out")), 3500);
-					}),
-				])
-			: await native;
-		const clean = await validateAvatarSvg(svg);
-		if (clean) return clean;
+		return await validateAvatarSvg(await getAvatarSvg(uuid, fresh));
 	} catch (error) {
-		if (signal.aborted) return DEFAULT_AVATAR_SVG;
-		console.error("Error loading avatar:", error);
-	} finally {
-		clearTimeout(timer);
-	}
-
-	if (!fallbackUrl || signal.aborted) return DEFAULT_AVATAR_SVG;
-	try {
-		const timeout = AbortSignal.timeout(3500);
-		const combined = AbortSignal.any([signal, timeout]);
-		const response = await fetch(fallbackUrl, {
-			signal: combined,
-			cache: fresh ? "no-store" : "default",
-		});
-		return response.ok ? await validateAvatarSvg(await response.text()) : DEFAULT_AVATAR_SVG;
-	} catch {
+		if (!signal.aborted) console.error("Error loading avatar:", error);
 		return DEFAULT_AVATAR_SVG;
 	}
 }
